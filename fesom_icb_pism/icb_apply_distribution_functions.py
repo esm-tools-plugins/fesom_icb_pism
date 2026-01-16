@@ -904,3 +904,113 @@ def PointTriangle_distance(lon0, lat0, lon1, lat1, lon2, lat2, lon3, lat3):
     p3 = point(lon3[ind], lat3[ind])
 
     return [p1, p2, p3], ind[0][0]
+
+def _read_nodes_for_cavity(meshpath):
+    """
+    Reads 2D node coordinates from a `nod2d.out` file in a given mesh path.
+    Returns: node_lon, node_lat, node_idx, node_coast arrays
+    """
+    with open(f'{meshpath}nod2d.out', 'r') as f:
+        num_nodes = int(f.readline())
+        nodes_lon = []
+        nodes_lat = []
+        nodes_idx = []
+        nodes_coast = []
+        
+        for _ in range(num_nodes):
+            parts = f.readline().split()
+            idx = int(parts[0]) - 1
+            lon = float(parts[1])
+            lat = float(parts[2])
+            coast = int(parts[3])
+            
+            nodes_lon.append(lon)
+            nodes_lat.append(lat)
+            nodes_idx.append(idx)
+            nodes_coast.append(coast)
+            
+    return np.array(nodes_lon), np.array(nodes_lat), np.array(nodes_idx), np.array(nodes_coast)
+
+
+def _read_elements_for_cavity(meshpath):
+    """
+    Reads element connectivity information from a `elem2d.out` file.
+    Returns: array of elements (n1, n2, n3) with 0-based node indices
+    """
+    with open(f'{meshpath}elem2d.out', 'r') as f:
+        num_elems = int(f.readline())
+        elements = []
+        for _ in range(num_elems):
+            parts = f.readline().split()
+            n1 = int(parts[0]) - 1
+            n2 = int(parts[1]) - 1
+            n3 = int(parts[2]) - 1
+            elements.append((n1, n2, n3))
+    return np.array(elements)
+
+
+def _read_element_levels(meshpath, which='cavity'):
+    """
+    Reads vertical level information from cavity_elvls.out file.
+    Returns: array of level indices, one for each element
+    """
+    with open(f'{meshpath}elem2d.out', 'r') as f:
+        num_elem = int(f.readline())
+    
+    if which == 'cavity':
+        filename = 'cavity_elvls.out'
+    else:
+        filename = 'elvls.out'
+    
+    with open(f'{meshpath}{filename}', 'r') as f:
+        elvls = []
+        for _ in range(num_elem):
+            parts = f.readline()
+            elvls.append(int(parts))
+    return np.array(elvls)
+
+
+def _build_elements_of_nodes(elements, node_idx):
+    """
+    For each node in the mesh, return the list of element indices that contain that node.
+    """
+    N = node_idx.size
+    ntri = elements.shape[0]
+    elems_of_node = [[] for _ in range(N)]
+
+    for tidx in range(ntri):
+        a, b, c = elements[tidx]
+        elems_of_node[a].append(tidx)
+        elems_of_node[b].append(tidx)
+        elems_of_node[c].append(tidx)
+
+    return elems_of_node
+
+
+def build_cavity_mask(meshpath, which='element'):
+    """
+    Builds a cavity mask for either elements or nodes based on cavity levels.
+    A node is considered in the cavity if all its connected elements are cavity elements.
+    
+    Parameters:
+        meshpath (str): Path to the directory containing mesh files.
+        which (str): 'element' to build mask for elements, 'node' for nodes.
+
+    Returns:
+        array of bool: Cavity mask array.
+    """
+    lev_cav = _read_element_levels(meshpath, which='cavity')
+    
+    if which == 'element':
+        cavity_mask = lev_cav > 1
+    elif which == 'node':
+        elements = _read_elements_for_cavity(meshpath)
+        node_stats = _read_nodes_for_cavity(meshpath)
+        elems_of_node = _build_elements_of_nodes(elements, node_stats[2])
+
+        cavity_mask = np.zeros(len(elems_of_node), dtype='bool')
+        for i, e in enumerate(elems_of_node):
+            if all(lev_cav[e] > 1):
+                cavity_mask[i] = True
+    
+    return cavity_mask
