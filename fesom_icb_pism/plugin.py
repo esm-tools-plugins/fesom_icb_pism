@@ -64,6 +64,14 @@ def update_icebergs(config):
         print(" * use scaling factors ", scaling_factor)
         bcavities = config["fesom"].get("use_cav", False)
 
+        # New parameters for FESOM input type
+        # input_type: "pism" (default, original PISM discharge) or "fesom" (FESOM cavity freshwater flux)
+        input_type = config["fesom"].get("icb_input_type", "pism")
+        # mesh_diag_file: path to fesom.mesh.diag.nc (defaults to mesh_dir + 'fesom.mesh.diag.nc')
+        mesh_diag_file = config["fesom"].get("mesh_diag_file", mesh_dir)
+        print(f" * icb_input_type = {input_type}")
+        print(f" * mesh_diag_file = {mesh_diag_file}")
+
         if isinstance(disch_file, list) and isinstance(basin_file, list):
             if len(disch_file) == len(basin_file):
                 domain = config["fesom"].get("domain", "sh")
@@ -80,6 +88,8 @@ def update_icebergs(config):
                         ibareamax=config["fesom"].get("ibareamax", 400),
                         domain=dom, #config["fesom"].get("domain", "sh"),
                         bcavities=bcavities,
+                        input_type=input_type,
+                        mesh_diag_file=mesh_diag_file,
                     )
                     ib.create_dataframe()
                     ib._icb_generator(fmode=fmode)
@@ -98,6 +108,8 @@ def update_icebergs(config):
                 seed=int(str(config["general"]["current_date"].year) + str(config["general"]["current_date"].month)), 
                 ibareamax=config["fesom"].get("ibareamax", 400),
                 bcavities=bcavities,
+                input_type=input_type,
+                mesh_diag_file=mesh_diag_file,
             )
             ib.create_dataframe()
             ib._icb_generator(fmode="w")
