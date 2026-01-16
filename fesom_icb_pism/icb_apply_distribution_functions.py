@@ -16,13 +16,18 @@ class IcebergCalving:
                 latest_restart_file="", abg=[50,15,-90],
                 scaling_factor=[1, 1, 1, 1, 1, 1],
                 seed=0, bcavities=False, ibareamax=400,
-                domain="SH"):
+                domain="SH",
+                input_type="pism",
+                mesh_diag_file=None):
         # set seed for random number generation
         random.seed(seed)
        
         print(" * seed = ", seed)
         print(" * cavity = ", str(bcavities))
-        # PISM section
+        print(" * input_type = ", input_type)
+        
+        # Store input type for later processing
+        self.input_type = input_type
         self.ifile = ifile
         self.icb_path = icb_path
         self.basin_file = basin_file
@@ -32,12 +37,8 @@ class IcebergCalving:
         self.cavity_elvls_file = os.path.join(mesh_path, "cavity_elvls.out")
         self.latest_restart_file = latest_restart_file
         self.abg = abg
-        self.name_of_discharge = "tendency_of_ice_amount_due_to_discharge" #"tendency_of_ice_amount_due_to_calving"
         self.rho_ice = 850
-        #self.bins = [0.01, 0.1, 1, 10, 100, 1000]
-        #self.weights_area = [0.0005, 0.0005, 0.008, 0.025, 0.074, 0.893]
-        #self.weights_dist = [0.4, 0.2, 0.15, 0.175, 0.05, 0.025]
-        #self.area_mean = [0.01, 0.1, 1, 10, 100, 1000]
+        self.rho_water = 1000
         self.bins = [0.1, 1, 10, 100, 1000]
         self.weights_area = [0.0005, 0.008, 0.025, 0.074, 0.893]
         self.weights_dist = [0.75, 0.175, 0.05, 0.02, 0.005]
@@ -45,7 +46,6 @@ class IcebergCalving:
         self.area_min = 0.01             #[km2]
         self.area_max = ibareamax           #[km2]
         self.min_disch_in_cell = 0.0   #[kg m-2 year-1]
-        #self.scaling_factor = np.array([1000, 100, 10, 1, 1, 1])
         self.scaling_factor = np.array(scaling_factor)
         self.thick = np.array([0.25, 0.25, 0.25, 0.25, 0.25, 0.25])
         self.thick_max = 0.25
@@ -54,11 +54,26 @@ class IcebergCalving:
 
         self.domain    = domain
         self.bcavities = bcavities
+        
+        # Set mesh_diag_file (used for FESOM input, defaults to mesh_path)
+        self.mesh_diag_file = mesh_diag_file if mesh_diag_file else mesh_path + "/fesom.mesh.diag.nc"
 
-        self._read_pism_file()
-        self._get_pism_resolution()
-        self._convert_to_kg_m2_year1()
-        self._get_coords()
+        if self.input_type == "pism":
+            # PISM section - original processing
+            self.name_of_discharge = "tendency_of_ice_amount_due_to_discharge"
+            self._read_pism_file()
+            self._get_pism_resolution()
+            self._convert_to_kg_m2_year1()
+            self._get_coords()
+        elif self.input_type == "fesom":
+            # FESOM freshwater flux section - new processing
+            self._read_fesom_fw_file()
+            self._apply_cavity_mask()
+            self._convert_fesom_to_m3_year()
+            self._get_fesom_coords()
+        else:
+            raise ValueError(f"Unknown input_type: {input_type}. Must be 'pism' or 'fesom'.")
+        
         self._read_basins_file()
 
         # FESOM section
@@ -77,8 +92,12 @@ class IcebergCalving:
             self.full_elems = []
 
     def create_dataframe(self):
-        self._get_data()
-        self._write_icb_mask()
+        if self.input_type == "pism":
+            # PISM processing: extract data and write mask
+            self._get_data()
+            self._write_icb_mask()
+        # For FESOM input, self.data is already populated in __init__
+        
         self._find_basins()
 
         if self.bcavities:
@@ -86,8 +105,18 @@ class IcebergCalving:
         
         self._find_FESOM_elem()
 
+        if self.input_type == "pism":
+            # PISM: convert from kg/m²/year to m³/year (equivalent ice volume)
+            disch_m3_year = self.data * self.res * self.res / self.rho_ice
+            
+        elif self.input_type == "fesom":
+            # FESOM: already in m³/year (water), convert to m³/year (equivalent ice volume) by scaling with rho_water/rho_ice
+            disch_m3_year = self.data * (self.rho_water / self.rho_ice)
+        
+        print(f" * total ice volume flux: {np.sum(disch_m3_year) * 1e-9:.2f} km3/year")
+        
         self.df = pd.DataFrame({
-                "disch": self.data * self.res * self.res / self.rho_ice, #[m3/year] 
+                "disch": disch_m3_year, #[m3/year] 
                 "elems": self.indices1D,
                 "basin": self.basins1D,
                 })
@@ -184,6 +213,85 @@ class IcebergCalving:
         self.lons = lons
         self.lats = lats
 
+    def _read_fesom_fw_file(self):
+        """
+        Read FESOM freshwater flux file (fw variable in m/s).
+        Handles all number of timesteps, e.g. daily (365 timesteps), monthly (12 timesteps) and annual (1 timestep) means.
+        Returns: fw_field (xarray.DataArray) as annual mean.
+        """
+        print(" * open FESOM freshwater flux file: ", self.ifile)
+        self.fl = xr.open_dataset(self.ifile, decode_times=False)
+        
+        # Get the fw variable
+        self.fw_field = self.fl['fw']
+        
+        # Check number of timesteps and compute annual mean
+        n_time = len(self.fl.time)
+        print(f" * number of timesteps in file: {n_time}")
+        
+        if n_time > 1:
+            # Monthly/Daily/... means - compute annual mean
+            print(" * detected number of timesteps ({n_time}), computing annual mean")
+            self.fw_annual = self.fw_field.mean(dim='time')
+        elif n_time == 1:
+            # Annual mean - use directly
+            print(" * detected annual data")
+            self.fw_annual = self.fw_field.squeeze(dim='time')
+        else:
+            print(f" * WARNING: unexpected number of timesteps ({n_time}), using mean over all")
+            self.fw_annual = self.fw_field.mean(dim='time')
+        
+        # Read mesh diagnostics for node_are
+        print(f" * reading mesh diagnostics from: {self.mesh_diag_file}")
+        self.mesh_diag = xr.open_dataset(self.mesh_diag_file)
+        
+        # Get node area (max(dim=nz))
+        self.node_area = self.mesh_diag['nod_area'].max(dim='nz')
+        
+    def _apply_cavity_mask(self):
+        """
+        Apply cavity mask to select only cavity gridcells.
+        Uses build_cavity_mask from helpers_mesh.
+        """
+        print(" * building cavity mask for nodes")
+        
+        # Build cavity mask for nodes
+        self.cavity_mask = build_cavity_mask(self.mesh_path, which='node')
+        n_cavity = np.sum(self.cavity_mask)
+        print(f" * found {n_cavity} cavity nodes out of {len(self.cavity_mask)} total nodes")
+        print(" * cavity mask shape: ", self.cavity_mask.shape)
+        print(" * fw annual shape: ", self.fw_annual.values.shape)
+        
+        # Apply mask to fw field - keep only cavity nodes
+        self.fw_cavity = self.fw_annual.values[self.cavity_mask]
+        self.node_area_cavity = self.node_area.values[self.cavity_mask]
+        
+        # Store cavity node indices for later coordinate lookup
+        self.cavity_node_indices = np.where(self.cavity_mask)[0]  
+        
+    def _convert_fesom_to_m3_year(self):
+        # input annual mean freshwater flux in m/s per m2 for each grid cell
+        # output annual absolute freshwater flux in m3/year for each grid cell
+        seconds_per_year = 365.25 * 86400  # ~31557600 s/year
+        self.data = self.fw_cavity * self.node_area_cavity * seconds_per_year # m/s * m2 * s/year = m3/(node*year)
+
+    def _get_fesom_coords(self):
+        """
+        Get lon/lat coordinates for calving nodes from mesh diagnostics.
+        """
+        # Get lon/lat from mesh diagnostics
+        all_lons = self.mesh_diag['lon'].values
+        all_lats = self.mesh_diag['lat'].values
+        
+        # Select coordinates for calving nodes
+        self.lons = list(all_lons[self.cavity_node_indices])
+        self.lats = list(all_lats[self.cavity_node_indices])
+        
+        # Normalize longitudes to -180 to 180 range
+        self.lons = [lon if lon < 180 else lon - 360 for lon in self.lons]
+        
+        print(f" * extracted coordinates for {len(self.lons)} cavity locations")
+
     def _read_basins_file(self):
         fl = xr.open_dataset(self.basin_file, decode_times=False)
         if "basin" in fl:
@@ -200,7 +308,10 @@ class IcebergCalving:
         abslon = np.abs(ds.lon-lon)
         c = np.maximum(abslon, abslat)
     
-        ([yloc], [xloc]) = np.where(c == np.min(c))
+        # Find minimum - may have multiple matches, take first one
+        min_indices = np.where(c == np.min(c))
+        yloc = min_indices[0][0]
+        xloc = min_indices[1][0]
         point_ds = ds.isel(x=xloc, y=yloc)
         return point_ds
 
@@ -322,6 +433,7 @@ class IcebergCalving:
     
         # get total discharge within basin in [km3 year-1]
         disch_tot = vals / 1e9
+        print(f" * total ice discharge within basin: {np.round(disch_tot, 2)} km3 year-1")
     
         # get total iceberg area within basin in [km2 year-1]
         # assuming constant iceberg height
@@ -733,10 +845,10 @@ class IcebergCalving:
                 np.savetxt(f, ib_elems_loc.depth.values * 1e3)
                 f.close()
             with open(os.path.join(self.icb_path, "icb_scaling.dat"), fmode) as f:
-                np.savetxt(f, ib_elems_loc.scaling.values)
+                np.savetxt(f, ib_elems_loc.scaling.values, fmt='%d')
                 f.close()
             with open(os.path.join(self.icb_path, "icb_felem.dat"), fmode) as f:
-                np.savetxt(f, ib_elems_loc.felem.values)
+                np.savetxt(f, ib_elems_loc.felem.values, fmt='%d')
                 f.close()
 
 
