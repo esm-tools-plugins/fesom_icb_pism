@@ -192,26 +192,35 @@ class IcebergCalving:
         tmp.to_netcdf(os.path.join(self.icb_path, "icb_mask.nc"))
 
     def _get_coords(self):
-        lon_bnds = self.fl.lon_bnds.where(self.disch_field < self.min_disch_in_cell, drop=True)
-        lon_bnds = np.array(lon_bnds).reshape(len(lon_bnds.x)*len(lon_bnds.y), 4)
-        lon_bnds = lon_bnds[~np.isnan(lon_bnds)]
-        lon_bnds = lon_bnds.reshape(int(len(lon_bnds)/4), 4)
+        # Take each discharge cell's centre from lon/lat, not by averaging the
+        # four lon_bnds corners.
+        #
+        # Averaging corner longitudes is unsafe on a polar grid. It fails
+        # outright for cells spanning the +/-180 meridian, where the mean of
+        # e.g. [-179.9, 179.9] is 0 rather than 180, and it also assumes the
+        # bounds are consistent with the centres. In practice both bit: a PISM
+        # discharge file whose lon_bnds came from a mirrored inverse projection
+        # (lon_bnds == 180 - lon, lat_bnds correct) put every berg on the wrong
+        # side of Antarctica -- median position error 79.9 deg over 3657
+        # discharge cells, the whole Ross front (true lon -179.6..180.0) landing
+        # near lon 0. Even with correct bounds the seam cells stay wrong: 3 of
+        # those 3657, 3.8 Gt/yr, still placed a hemisphere away.
+        #
+        # lon/lat in the same file ARE the cell centres, so no derivation is
+        # needed and neither failure mode applies. Ordering matches _get_data:
+        # same .where(..., drop=True), same C-order ravel, same NaN mask, so
+        # lons/lats stay aligned with self.data element for element.
+        lon = self.fl.lon.where(self.disch_field < self.min_disch_in_cell, drop=True)
+        lon = np.array(lon).ravel()
+        lon = lon[~np.isnan(lon)]
 
-        lat_bnds = self.fl.lat_bnds.where(self.disch_field < self.min_disch_in_cell, drop=True)
-        lat_bnds = np.array(lat_bnds).reshape(len(lat_bnds.x)*len(lat_bnds.y), 4)
-        lat_bnds = lat_bnds[~np.isnan(lat_bnds)]
-        lat_bnds = lat_bnds.reshape(int(len(lat_bnds)/4), 4)
+        lat = self.fl.lat.where(self.disch_field < self.min_disch_in_cell, drop=True)
+        lat = np.array(lat).ravel()
+        lat = lat[~np.isnan(lat)]
 
-        lons = []
-        lats = []
-
-        for x, y in zip(lon_bnds, lat_bnds):
-            lons.append(np.mean(x))
-            lats.append(np.mean(y))
-
-        lons = [lon if lon<180 else lon-360 for lon in lons]
+        lons = [l if l < 180 else l - 360 for l in lon]
         self.lons = lons
-        self.lats = lats
+        self.lats = list(lat)
 
     def _read_fesom_fw_file(self):
         """
