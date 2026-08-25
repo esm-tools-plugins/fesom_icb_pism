@@ -778,22 +778,56 @@ class IcebergCalving:
   
                     ##############################################################
                     # exclude coastal nodes (and full cells)
-                    elems_to_drop = self.full_elems
-                
-                    for felem in felems:
-                        nodes = self.elem2d.loc[felem].values
-                        coastal = False
-                        for node in nodes:
-                            lon, lat, tmp = self.nod2d.loc[node]
-                            if (tmp == 1 or coastal == 1):
-                                coastal = True
-                    
-                        if coastal == 1:
-                            elems_to_drop.append(felem)
+                    #
+                    # set(), not a bare reference: this used to alias
+                    # self.full_elems and append to it, which permanently mutated
+                    # the instance -- a second _icb_generator call started with a
+                    # polluted list -- and made the membership test below a linear
+                    # scan over a list that grew with every basin.
+                    elems_to_drop = set(self.full_elems)
 
-                    #print(" * drop these element indices: ", elems_to_drop) 
-                    new_felems = [elem for elem in felems if elem not in elems_to_drop]
-                    felems = new_felems
+                    def _is_coastal(felem):
+                        return any(self.nod2d.loc[node].iloc[2] == 1
+                                   for node in self.elem2d.loc[felem].values)
+
+                    for felem in felems:
+                        if _is_coastal(felem):
+                            elems_to_drop.add(felem)
+
+                    open_felems = [elem for elem in felems if elem not in elems_to_drop]
+
+                    # A basin whose every assigned element touches a coastal node
+                    # ends up with nothing here. That used to fall straight through
+                    # the `if len(felems) != 0` below, so the basin produced no
+                    # bergs and its discharge vanished with no message at all.
+                    # Measured at 96.5 Gt/yr across two basins (Dronning Maud West
+                    # and Victoria Land) in one coupling cycle, 2.9% of the total.
+                    #
+                    # Fall back rather than drop the mass, and say so either way.
+                    # The elements one ring out are open water adjacent to this
+                    # basin's own margin, so the freshwater still enters in the
+                    # right place. Coastal elements are the last resort: worse
+                    # placement, but conserving the mass beats deleting it.
+                    basin_id = b.name
+                    if open_felems:
+                        felems = open_felems
+                    else:
+                        neigh = set()
+                        for n in b["neigh."]:
+                            neigh.update(list(n))
+                        neigh.difference_update(felems)
+                        open_neigh = [elem for elem in sorted(neigh)
+                                      if elem not in elems_to_drop
+                                      and not _is_coastal(elem)]
+                        if open_neigh:
+                            print(f" * WARNING: basin {basin_id}: all {len(felems)} "
+                                  f"assigned elements are coastal; falling back to "
+                                  f"{len(open_neigh)} open neighbour elements")
+                            felems = open_neigh
+                        else:
+                            print(f" * WARNING: basin {basin_id}: no open element in "
+                                  f"the basin or its neighbours; placing on "
+                                  f"{len(felems)} COASTAL elements to conserve mass")
                     ##############################################################
 
                     if len(felems) != 0:
