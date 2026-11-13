@@ -1,7 +1,8 @@
 import f90nml
 import os
 
-from .icb_apply_distribution_functions import IcebergCalving
+from .icb_apply_distribution_functions_v3_cai import IcebergCalving
+from .core import run_iceberg_generation
 
 from esm_runscripts.namelists import Namelist
 
@@ -14,16 +15,15 @@ def prep_icebergs(config):
             config = update_icebergs(config)
             if ((config["general"].get("run_number", 0) == 1) or (not os.path.exists(config["fesom"]["restart_in_sources"].get("icb_restart_ISM")))):
                 print("* either first year of simulation or icb_restart_ISM is missing")
-                if not os.path.isfile(
+                # always reset (was: only if the file did not exist). A stale
+                # count from an earlier run would make ib_num larger than the
+                # number of bergs FESOM can actually read.
+                with open(
                     config["general"]["experiment_couple_dir"]
-                    + "/num_non_melted_icb_file"
-                ):
-                    with open(
-                        config["general"]["experiment_couple_dir"]
-                        + "/num_non_melted_icb_file",
-                        "w",
-                    ) as f:
-                        f.write("0")
+                    + "/num_non_melted_icb_file",
+                    "w",
+                ) as f:
+                    f.write("0")
             else:
                 num_lines = sum(
                     1
@@ -64,25 +64,52 @@ def update_icebergs(config):
         print(" * use scaling factors ", scaling_factor)
         bcavities = config["fesom"].get("use_cav", False)
 
+        if config["fesom"].get("rotate", False):
+            abg = [50,15,-90]
+        else:
+            abg = [0,0,0]
+
         if isinstance(disch_file, list) and isinstance(basin_file, list):
             if len(disch_file) == len(basin_file):
                 domain = config["fesom"].get("domain", "sh")
+                if isinstance(domain, str):
+                    # a single string would otherwise be zipped letter by letter
+                    domain = [domain] * len(disch_file)
+                if len(domain) != len(disch_file):
+                    print(" * domain must be a string or a list as long as disch_file! Exit")
+                    return -1
                 fmode = "w"
                 for dfile,bfile,dom in zip(disch_file, basin_file, domain):
-                    ib = IcebergCalving(
-                        dfile,
-                        mesh_dir,
-                        iceberg_dir,
-                        bfile,
-                        icb_restart_file,
-                        scaling_factor=scaling_factor,
-                        seed=int(str(config["general"]["current_date"].year) + str(config["general"]["current_date"].month)),
-                        ibareamax=config["fesom"].get("ibareamax", 400),
-                        domain=dom, #config["fesom"].get("domain", "sh"),
-                        bcavities=bcavities,
-                    )
-                    ib.create_dataframe()
-                    ib._icb_generator(fmode=fmode)
+                    if config["fesom"].get("icbgen_engine", "none") == "chatgpt":
+                        icebergs = run_iceberg_generation(
+                                    dfile,
+                                    bfile,
+                                    os.path.join(mesh_dir,"nod2d.out"),
+                                    os.path.join(mesh_dir,"elem2d.out"),
+                                    random_seed=int(str(config["general"]["current_date"].year) + str(config["general"]["current_date"].month)),
+                                    max_size=config["fesom"].get("ibareamax", 2500),
+                                    min_size=config["fesom"].get("ibareamin", 100),
+                                    factors=scaling_factor,
+                                    wmode=fmode,
+                                    output_prefix=iceberg_dir+"/icb_",
+                        )
+                    else:
+                        ib = IcebergCalving(
+                            dfile,
+                            mesh_dir,
+                            iceberg_dir,
+                            bfile,
+                            icb_restart_file,
+                            scaling_factor=scaling_factor,
+                            seed=int(str(config["general"]["current_date"].year) + str(config["general"]["current_date"].month)),
+                            ibareamax=config["fesom"].get("ibareamax", 400),
+                            domain=dom, #config["fesom"].get("domain", "sh"),
+                            bcavities=bcavities,
+                            abg=abg,
+                        )
+                        ib.create_distribution() #ib.create_dataframe()
+                        ib.generate_icebergs(fmode=fmode) #ib._icb_generator(fmode=fmode)
+                    
                     fmode = "a"
             else:
                 print(" * disch_file and basin_file need to be of same length! Exit")
@@ -95,12 +122,14 @@ def update_icebergs(config):
                 basin_file,
                 icb_restart_file,
                 scaling_factor=scaling_factor,
-                seed=int(str(config["general"]["current_date"].year) + str(config["general"]["current_date"].month)), 
+                seed=int(str(config["general"]["current_date"].year) + str(config["general"]["current_date"].month)),
                 ibareamax=config["fesom"].get("ibareamax", 400),
+                domain=config["fesom"].get("domain", "sh"),
                 bcavities=bcavities,
+                abg=abg,
             )
-            ib.create_dataframe()
-            ib._icb_generator(fmode="w")
+            ib.create_distribution() #ib.create_dataframe()
+            ib.generate_icebergs(fmode="w") #ib._icb_generator(fmode=fmode)
     return config
 
 
