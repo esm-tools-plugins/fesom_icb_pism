@@ -1,28 +1,96 @@
-import numpy as np
-import xarray as xr
-import pandas as pd
-import numexpr as ne
-import numpy.random as random
-import powerlaw
-import sys
-import os
+"""
+icb_apply_distribution_functions_v3_cai.py
+
+Bugs fixed vs v2
+----------------
+* Coordinate system: all element KDTree queries and iceberg position generation
+  are now performed in the FESOM *rotated* coordinate frame (raw nod2d.out
+  lon/lat), exactly matching FESOM's internal point_in_triangle search.  PISM
+  calving positions (geographic) are converted to rotated via g2r before the
+  KDTree query.  Iceberg positions are generated as barycentric combinations of
+  rotated node coordinates and converted back to geographic (r2g) before being
+  written to icb_longitude.dat / icb_latitude.dat, which FESOM reads as
+  geographic and converts internally via g2r.
+
+  v2 queried a *rotated* KDTree with *geographic* PISM positions — backward.
+  The first v3 attempt switched the KDTree to geographic (mesh.x2/y2) but
+  FESOM's point_in_triangle still searches in rotated space, so a valid element
+  in geographic can map to a rejected region in rotated.  This version fixes that
+  by working in rotated space throughout element assignment.
+
+* Invalid-element filter: mirrors FESOM icb_step.F90 exactly:
+    reject = all( cavity_depth(nodes) != 0  .OR.  bc_index_nod2D(nodes) == 0 )
+  i.e. rejected when every node is either a cavity node (cavity_depth@node.out
+  != 0) or a boundary-edge node.  Boundary-edge nodes are identified from mesh
+  topology (edges shared by exactly one element) — not from nod2d.out's coastal
+  column, which has no relation to FESOM's bc_index_nod2D.
+
+All other logic (PISM file reading, size distribution, scaling, basin assignment,
+full-cell detection, output) is unchanged from v2.
+
+Coordinate frame (clarification, 2026-11)
+-----------------------------------------
+"Rotated" above means the frame of nod2d.out, i.e. the mesh frame.  For meshes
+run with force_rotation=.true. (e.g. CORE2) nod2d.out is *geographic* and abg
+must be [0, 0, 0] (plugin option rotate: false); g2r/r2g are then the identity.
+For meshes stored in rotated coordinates pass the mesh's Euler angles as abg.
+The g2r matrix is identical to FESOM's (gen_modules_rotate_grid.F90).
+
+Changes 2026-11
+---------------
+* Exact volume closure in _create_icebergs_within_basin (seeded volume equals
+  PISM discharge).
+* Element search uses 3-D unit vectors (true nearest element), not lon/lat
+  degrees, which exaggerated east-west distances at high latitude.
+* Saturation: a running per-element iceberg area (restart bergs + bergs placed
+  in this call) is kept; elements are filled in order "berg fits" > "element
+  not yet full" > next ring of neighbours, so no berg (no mass) is dropped.
+* Position RNG uses the seed argument (was fixed to 0 every year).
+* Bergs in size bins beyond len(scaling_factor) are kept with scaling 1
+  (were silently dropped).
+"""
+
 import math
-from tqdm import tqdm
-import pyfesom2 as pf
+import os
 import time
 
+import numpy as np
+import pandas as pd
+import powerlaw
+import pyfesom2 as pf
+import xarray as xr
+from scipy.spatial import KDTree
+from tqdm import tqdm
+
+
 class IcebergCalving:
-    def __init__(self, ifile, mesh_path, icb_path, basin_file, 
-                latest_restart_file="", abg=[50,15,-90],
-                scaling_factor=[1, 1, 1, 1, 1, 1],
-                seed=0, bcavities=False, ibareamax=400,
-                domain="SH"):
-        # set seed for random number generation
-        random.seed(seed)
-       
-        print(" * seed = ", seed)
-        print(" * cavity = ", str(bcavities))
-        # PISM section
+
+    def __init__(
+        self,
+        ifile,
+        mesh_path,
+        icb_path,
+        basin_file,
+        latest_restart_file="",
+        abg=None,
+        scaling_factor=None,
+        seed=0,
+        bcavities=True,
+        ibareamax=400,
+        domain="SH",
+    ):
+        if abg is None:
+            abg = [50, 15, -90]
+        if scaling_factor is None:
+            scaling_factor = [1, 1, 1, 1, 1, 1]
+
+        np.random.seed(seed)
+        self.seed = int(seed)
+        print(f" * seed        = {seed}")
+        print(f" * bcavities   = {bcavities}")
+        print(f" * domain      = {domain}")
+
+        # paths
         self.ifile = ifile
         self.icb_path = icb_path
         self.basin_file = basin_file
@@ -30,765 +98,853 @@ class IcebergCalving:
         self.nod2d_file = os.path.join(mesh_path, "nod2d.out")
         self.elem2d_file = os.path.join(mesh_path, "elem2d.out")
         self.cavity_elvls_file = os.path.join(mesh_path, "cavity_elvls.out")
+        self.cavity_depth_node_file = os.path.join(mesh_path, "cavity_depth@node.out")
         self.latest_restart_file = latest_restart_file
         self.abg = abg
-        self.name_of_discharge = "tendency_of_ice_amount_due_to_discharge" #"tendency_of_ice_amount_due_to_calving"
+
+        # physical / numerical settings
+        self.name_of_discharge = "tendency_of_ice_amount_due_to_discharge"
         self.rho_ice = 850
-        #self.bins = [0.01, 0.1, 1, 10, 100, 1000]
-        #self.weights_area = [0.0005, 0.0005, 0.008, 0.025, 0.074, 0.893]
-        #self.weights_dist = [0.4, 0.2, 0.15, 0.175, 0.05, 0.025]
-        #self.area_mean = [0.01, 0.1, 1, 10, 100, 1000]
         self.bins = [0.1, 1, 10, 100, 1000]
         self.weights_area = [0.0005, 0.008, 0.025, 0.074, 0.893]
         self.weights_dist = [0.75, 0.175, 0.05, 0.02, 0.005]
         self.area_mean = [0.01, 0.1, 1, 10, 100]
-        self.area_min = 0.01             #[km2]
-        self.area_max = ibareamax           #[km2]
-        self.min_disch_in_cell = 0.0   #[kg m-2 year-1]
-        #self.scaling_factor = np.array([1000, 100, 10, 1, 1, 1])
-        self.scaling_factor = np.array(scaling_factor)
-        self.thick = np.array([0.25, 0.25, 0.25, 0.25, 0.25, 0.25])
-        self.thick_max = 0.25
-        self.depth = self.thick * 7/8
-        self.height = self.thick - self.depth
-
-        self.domain    = domain
+        self.area_min = 0.01        # km²
+        self.area_max = ibareamax   # km²
+        self.min_disch_in_cell = 0.0
+        self.thick_max = 0.25       # km
+        self.scaling_factor = np.asarray(scaling_factor, dtype=int)
+        self.domain = domain
         self.bcavities = bcavities
 
+        # ── read PISM discharge ────────────────────────────────────────
         self._read_pism_file()
         self._get_pism_resolution()
         self._convert_to_kg_m2_year1()
-        self._get_coords()
-        self._read_basins_file()
 
-        # FESOM section
-        self._read_mesh()
-        self._read_nod2d_file()
+        # ── read FESOM mesh ────────────────────────────────────────────
+        self._read_mesh()          # pf.load_mesh → mesh.voltri for _get_full_cells
+        self._read_nod2d_file()    # rotated lon/lat from nod2d.out
         self._read_elem2d_file()
-        
-        if self.bcavities and os.path.isfile(self.cavity_elvls_file):
-            self._read_cavity_elvls_file()
+        self._build_rotation_matrix()   # g2r / r2g from abg Euler angles
 
-        if not self.latest_restart_file=="" and os.path.exists(self.latest_restart_file):
-            print(" * restart file ", self.latest_restart_file)
+        # ── node-level cavity depths ───────────────────────────────────
+        self._cavity_node_depth = None
+        if os.path.isfile(self.cavity_depth_node_file):
+            self._read_cavity_depth_node_file()
+        elif self.bcavities:
+            print(
+                " * WARNING: bcavities=True but cavity_depth@node.out not found; "
+                "cavity filtering skipped"
+            )
+
+        # ── build valid-element set ────────────────────────────────────
+        self._build_node_coord_arrays()   # rotated coords from nod2d.out
+        self._build_valid_elem_set()      # exact FESOM rejection filter
+
+        # ── spatial indices ────────────────────────────────────────────
+        self._build_elem_tree()          # KDTree on rotated element centroids
+        self._build_neighbour_graph()    # O(1) neighbour lookup
+
+        # ── basin grid ────────────────────────────────────────────────
+        self._read_basins_file()
+        self._build_basin_tree()
+
+        # ── saturated cells from restart ──────────────────────────────
+        if latest_restart_file and os.path.exists(latest_restart_file):
+            print(f" * restart file: {latest_restart_file}")
             self._get_full_cells()
         else:
-            print("* no restart file found, continue anyway...")
-            self.full_elems = []
+            print(" * no restart file found, continuing...")
+            self.full_elems = set()
+            self.elem_fill = {}
 
-    def create_dataframe(self):
-        self._get_data()
-        self._write_icb_mask()
-        self._find_basins()
+    # ══════════════════════════════════════════════════════════════════
+    # Public API
+    # ══════════════════════════════════════════════════════════════════
 
-        if self.bcavities:
-            self._remove_cavities()
-        
-        self._find_FESOM_elem()
+    def create_distribution(self):
+        """
+        Filter PISM cells, assign basins and FESOM elements, build df_agg.
+        Must be called before generate_icebergs().
+        """
+        self._extract_valid_cells()
+        self._assign_basins()
+        self._assign_fesom_elems()
 
         self.df = pd.DataFrame({
-                "disch": self.data * self.res * self.res / self.rho_ice, #[m3/year] 
-                "elems": self.indices1D,
-                "basin": self.basins1D,
-                })
-        self.df.dropna(inplace=True)
-        self.df_agg = self.df.get(["disch", "basin"]).groupby("basin").sum()
+            "disch": self.data * self.res * self.res / self.rho_ice,  # m³/year
+            "elem":  self.elem_ids,
+            "basin": self.basins1D,
+        }).dropna()
 
-        elem_tmp = []
-        neigh_tmp = []
-        
-        # iterate over basins
-        for b in self.df.groupby("basin"):
+        self.df_agg = self.df[["disch", "basin"]].groupby("basin").sum()
 
-            # get all FESOM elements nearest to discharge location within this basin 
-            # every element shall occur only once
-            elem_tmp.append(b[1]["elems"].unique())
-            n=[]
-            for x in elem_tmp[-1]:
-                
-                # get all neighbouring elements for each FESOM element
-                # every above found FESOM element is associated with a list of neighbouring elements
-                n.append(self._get_FESOM_neighbours(x))
-                
-                ################################################   
-                #tmp = self._get_FESOM_neighbours(x)
-                #m=[]
-                #for y in tmp:
-                #    m = m + self._get_FESOM_neighbours(y)
-                #n.append(np.unique(m))
-                ################################################
-            neigh_tmp.append(n)
-        
-        self.df_agg["elems"] = elem_tmp
-        self.df_agg["neigh."] = neigh_tmp
+        elem_lists, neigh_lists = [], []
+        for _bid, grp in self.df.groupby("basin"):
+            unique_elems = grp["elem"].unique().astype(int)
+            elem_lists.append(unique_elems)
+            neigh_lists.append([self.neighbours.get(int(e), []) for e in unique_elems])
 
-    def _set_min_disch_in_cell(self, min_disch_in_cell):
-        self.min_disch_in_cell = min_disch_in_cell
+        self.df_agg["elems"]  = elem_lists
+        self.df_agg["neigh."] = neigh_lists
+
+        print(
+            f" * {len(self.df)} discharge cells across "
+            f"{len(self.df_agg)} basins"
+        )
+
+    def generate_icebergs(self, fmode="w"):
+        """
+        Generate iceberg calving files from the distribution built by
+        create_distribution().  Output files are written to self.icb_path.
+        Iceberg positions are generated in the mesh frame of nod2d.out (see
+        module docstring) and converted to geographic (r2g) for
+        icb_longitude.dat / icb_latitude.dat, which FESOM reads as geographic.
+
+        Element choice keeps a running iceberg area per element (restart bergs
+        + bergs placed here) so that elements are not overfilled within one
+        call; no berg is dropped (mass conservation has priority, see
+        _choose_elem).
+        """
+        rng = np.random.default_rng(self.seed)
+        fill = dict(getattr(self, "elem_fill", {}))   # 0-based elem -> m²
+        all_rows = []
+
+        with tqdm(
+            total=len(self.df_agg), file=sys.stdout, desc="generate icebergs per basin"
+        ) as pbar:
+            for basin_id in self.df_agg.index:
+                b = self.df_agg.loc[basin_id]
+                print(f"*** BASIN = {basin_id}")
+
+                while True:
+                    ib_tmp = self._create_icebergs_within_basin(b, idx=basin_id)
+                    if not isinstance(ib_tmp, pd.DataFrame):
+                        continue
+                    break
+
+                if isinstance(ib_tmp, pd.DataFrame) and ib_tmp.empty:
+                    pbar.update(1)
+                    continue
+
+                ib_df = self._scale_icebergs(ib_tmp)
+                n_ib = len(ib_df)
+                if n_ib == 0:
+                    pbar.update(1)
+                    continue
+
+                candidates = set(int(e) for e in b.elems.tolist())
+                if not self.bcavities:
+                    for neigh_list in b["neigh."]:
+                        candidates.update(int(e) for e in neigh_list)
+                candidates = sorted(
+                    e for e in candidates if e in self.valid_elem_idx_set
+                )
+
+                basin_df = self.df[self.df["basin"] == basin_id]
+                disch_by_elem = (
+                    basin_df.groupby("elem")["disch"].sum().abs()
+                )
+
+                # place the largest objects first so they get the most room
+                ib_area = (
+                    (ib_df["length"].values * 1e3) ** 2
+                    * ib_df["scaling"].values
+                )   # m²
+                chosen_global = np.empty(n_ib, dtype=int)
+                for k in np.argsort(-ib_area, kind="stable"):
+                    e = self._choose_elem(
+                        candidates, disch_by_elem, fill, ib_area[k], rng,
+                        basin_id,
+                    )
+                    chosen_global[k] = e
+                    fill[e] = fill.get(e, 0.0) + float(ib_area[k])
+
+                pos = np.array([self._elem_pos_map[e] for e in chosen_global])
+                r1 = rng.uniform(0.25, 0.75, n_ib)
+                r2 = rng.uniform(0.25, 0.75, n_ib)
+                s = np.sqrt(r1)
+                w1, w2, w3 = (1 - s), s * (1 - r2), s * r2
+                lons_rot, lats_rot = self._barycentric_rotated(pos, w1, w2, w3)
+                # Convert to geographic: FESOM reads icb_longitude.dat as
+                # geographic and converts internally via g2r.
+                lons_ib, lats_ib = self._rot_to_geo(lons_rot, lats_rot)
+
+                for i, (_, row) in enumerate(ib_df.iterrows()):
+                    all_rows.append({
+                        "length":  row.length,
+                        "depth":   row.depth,
+                        "scaling": row.scaling,
+                        "lon":     float(lons_ib[i]),
+                        "lat":     float(lats_ib[i]),
+                        "felem":   int(chosen_global[i]),
+                    })
+
+                pbar.update(1)
+
+        # Always (re)write the files, also when no bergs were generated:
+        # otherwise the previous year's icb_*.dat stay in place and are
+        # counted and released by FESOM a second time (mass duplication).
+        out = pd.DataFrame(
+            all_rows,
+            columns=["length", "depth", "scaling", "lon", "lat", "felem"],
+        )
+        if out.empty:
+            print(f" * no icebergs generated (files written empty, mode '{fmode}')")
+        os.makedirs(self.icb_path, exist_ok=True)
+
+        def _save(fname, arr):
+            path = os.path.join(self.icb_path, fname)
+            with open(path, fmode) as f:
+                np.savetxt(f, arr)
+
+        _save("icb_longitude.dat", out["lon"].values)
+        _save("icb_latitude.dat",  out["lat"].values)
+        _save("icb_length.dat",    out["length"].values * 1e3)   # km → m
+        _save("icb_height.dat",    out["depth"].values  * 1e3)   # km → m
+        _save("icb_scaling.dat",   out["scaling"].values)
+        _save("icb_felem.dat",     out["felem"].values)
+        _save("icb_calving_day.dat",    np.zeros(len(out["lon"].values)))
+
+        print(f" * wrote {len(out)} iceberg records to {self.icb_path}")
+
+    def _choose_elem(self, candidates, disch_by_elem, fill, area, rng,
+                     basin_id, max_rings=10):
+        """
+        Pick one element for an iceberg object of total area `area` [m²].
+
+        Tiers, tried on the candidate set and then on successive rings of
+        valid neighbours (up to max_rings):
+          1. elements where the object fits (fill + area <= element area)
+          2. elements not yet full (fill < element area)
+        Within a tier the choice is weighted by the element's discharge
+        (uniform if all candidates in the tier have zero discharge).
+        If nothing qualifies, the least-filled element seen is used and a
+        warning is printed, i.e. mass conservation has priority over the
+        saturation limit.
+        """
+        voltri = self.mesh.voltri
+        cset = list(candidates)
+        seen = set(cset)
+        frontier = list(cset)
+        for ring in range(max_rings + 1):
+            if cset:
+                c = np.asarray(cset, dtype=int)
+                free = voltri[c] - np.array([fill.get(int(e), 0.0) for e in c])
+                for ok in (free >= area, free > 0):
+                    if ok.any():
+                        cc = c[ok]
+                        w = disch_by_elem.reindex(cc, fill_value=0.0).values
+                        w = np.ones(cc.size) if w.sum() <= 0 else w
+                        return int(rng.choice(cc, p=w / w.sum()))
+            # next ring of valid neighbours
+            nxt = []
+            for e in frontier:
+                for n in self.neighbours.get(int(e), []):
+                    if n not in seen:
+                        seen.add(n)
+                        nxt.append(n)
+            if not nxt:
+                break
+            frontier = nxt
+            cset = nxt
+        allc = np.asarray(sorted(seen), dtype=int)
+        e = int(allc[np.argmin(
+            [fill.get(int(x), 0.0) / voltri[x] for x in allc]
+        )])
+        print(
+            f"  * WARNING basin {basin_id}: no unsaturated element within "
+            f"{max_rings} rings; placing {area/1e6:.1f} km² in least-filled "
+            f"element {e + 1}"
+        )
+        return e
+
+    def write_icb_mask(self):
+        """Write the discharge mask (cells with calving flux) to icb_mask.nc."""
+        tmp = self.disch_field.where(
+            self.disch_field < self.min_disch_in_cell
+        ).fillna(0)
+        tmp.to_netcdf(os.path.join(self.icb_path, "icb_mask.nc"))
+
+    # ══════════════════════════════════════════════════════════════════
+    # Initialisation helpers
+    # ══════════════════════════════════════════════════════════════════
 
     def _read_mesh(self):
+        # Only used for self.mesh.voltri (element areas) in _get_full_cells.
+        # Coordinates come from nod2d.out (rotated), not from mesh.x2/y2.
         self.mesh = pf.load_mesh(self.mesh_path, self.abg, usepickle=False)
 
     def _read_pism_file(self):
-        print(" * open latest discharge file: ", self.ifile)
+        print(f" * open discharge file: {self.ifile}")
         self.fl = xr.open_dataset(self.ifile, decode_times=False).squeeze()
-        self.disch_field = self.fl.get(self.name_of_discharge)
+        self.disch_field = self.fl[self.name_of_discharge]
         self.disch_units = self.disch_field.units
 
     def _get_pism_resolution(self):
-        res_x = (self.fl.x[-1] - self.fl.x[0]) / (len(self.fl.x) - 1) 
-        res_y = (self.fl.y[-1] - self.fl.y[0]) / (len(self.fl.y) - 1) 
-        if res_x != res_y:
-            print(" * non-quadratic grid cells. Not sure what to do ...")
-            exit
-        else:
-            self.res = res_x.values #[m]
-            print("self.res = ", self.res)
+        res_x = float((self.fl.x[-1] - self.fl.x[0]) / (len(self.fl.x) - 1))
+        res_y = float((self.fl.y[-1] - self.fl.y[0]) / (len(self.fl.y) - 1))
+        if abs(res_x - res_y) / max(abs(res_x), abs(res_y)) > 1e-3:
+            print(
+                f" * WARNING: non-square PISM grid cells "
+                f"({res_x:.1f} m × {res_y:.1f} m)"
+            )
+        self.res = res_x
+        print(f" * PISM resolution: {self.res:.0f} m")
 
     def _convert_to_kg_m2_year1(self):
         if self.disch_units == "Gt year-1":
-            self.disch_field = self.disch_field * 1e12 / ( self.res * self.res )
+            self.disch_field = (
+                self.disch_field * 1e12 / (self.res * self.res)
+            )
 
-    def _get_data(self):
-        data = self.disch_field.where(self.disch_field < self.min_disch_in_cell, drop=True)
-        data = np.array(data).reshape(1, len(data.x) * len(data.y))
-        self.data = data[~np.isnan(data)]
+    def _read_nod2d_file(self):
+        # nod2d.out: header line (node count), then: node_id  lon  lat  coastal
+        # Node IDs (1-based) become the index; lon/lat are in the mesh frame
+        # (geographic for force_rotation meshes, see module docstring) and are
+        # used directly in _build_node_coord_arrays.
+        self.nod2d = pd.read_csv(
+            self.nod2d_file, header=0,
+            names=["lon", "lat", "coastal"],
+            sep=r"\s+", index_col=0,
+        )
 
-    def _write_icb_mask(self): 
-        tmp = self.disch_field.where(self.disch_field < self.min_disch_in_cell).fillna(0) 
-        #tmp = xr.DataArray(self.disch_field.where(self.disch_field < self.min_disch_in_cell).squeeze(), 
-        #        coords={
-        #        "x": self.fl.x.values, 
-        #        "y": self.fl.y.values}, 
-        #        dims=["x", "y"], name=self.name_of_discharge)
-        tmp.to_netcdf(os.path.join(self.icb_path, "icb_mask.nc"))
+    def _read_elem2d_file(self):
+        self.elem2d = pd.read_csv(
+            self.elem2d_file, header=0,
+            names=["nod1", "nod2", "nod3"],
+            sep=r"\s+",
+        )
 
-    def _get_coords(self):
-        lon_bnds = self.fl.lon_bnds.where(self.disch_field < self.min_disch_in_cell, drop=True)
-        lon_bnds = np.array(lon_bnds).reshape(len(lon_bnds.x)*len(lon_bnds.y), 4)
-        lon_bnds = lon_bnds[~np.isnan(lon_bnds)]
-        lon_bnds = lon_bnds.reshape(int(len(lon_bnds)/4), 4)
+    def _read_cavity_depth_node_file(self):
+        tmp = pd.read_csv(self.cavity_depth_node_file, names=["depth"], sep=r"\s+")
+        nids = self.nod2d.index.values.astype(int)
+        max_nid = int(nids.max())
+        self._cavity_node_depth = np.zeros(max_nid + 1, dtype=np.float32)
+        self._cavity_node_depth[nids] = tmp["depth"].values[: len(nids)]
+        n_cav = (self._cavity_node_depth[nids] != 0).sum()
+        print(f" * cavity nodes: {n_cav} of {len(nids)}")
 
-        lat_bnds = self.fl.lat_bnds.where(self.disch_field < self.min_disch_in_cell, drop=True)
-        lat_bnds = np.array(lat_bnds).reshape(len(lat_bnds.x)*len(lat_bnds.y), 4)
-        lat_bnds = lat_bnds[~np.isnan(lat_bnds)]
-        lat_bnds = lat_bnds.reshape(int(len(lat_bnds)/4), 4)
+    def _build_rotation_matrix(self):
+        """
+        Build g2r (geographic→rotated) and r2g (rotated→geographic) matrices
+        from the Euler angles abg=[alpha, beta, gamma] using the ZXZ convention
+        in FESOM's gen_modules_rotate_grid.F90 (set_mesh_transform_matrix).
+        """
+        al = np.radians(self.abg[0])
+        be = np.radians(self.abg[1])
+        ga = np.radians(self.abg[2])
+        r2g = np.array([
+            [np.cos(al)*np.cos(ga) - np.sin(al)*np.cos(be)*np.sin(ga),
+             -np.cos(al)*np.sin(ga) - np.sin(al)*np.cos(be)*np.cos(ga),
+             np.sin(al)*np.sin(be)],
+            [np.sin(al)*np.cos(ga) + np.cos(al)*np.cos(be)*np.sin(ga),
+             -np.sin(al)*np.sin(ga) + np.cos(al)*np.cos(be)*np.cos(ga),
+             -np.cos(al)*np.sin(be)],
+            [np.sin(be)*np.sin(ga),
+             np.sin(be)*np.cos(ga),
+             np.cos(be)],
+        ])
+        self._r2g = r2g
+        self._g2r = r2g.T
 
-        lons = []
-        lats = []
+    def _geo_to_rot(self, lon_deg, lat_deg):
+        """Vectorised geographic → rotated transform (degrees in, degrees out)."""
+        lon = np.radians(lon_deg); lat = np.radians(lat_deg)
+        x = np.cos(lat) * np.cos(lon)
+        y = np.cos(lat) * np.sin(lon)
+        z = np.sin(lat)
+        xyz = np.stack([x, y, z], axis=-1)   # (..., 3)
+        xyzr = xyz @ self._g2r.T             # g2r @ each column
+        lon_r = np.degrees(np.arctan2(xyzr[..., 1], xyzr[..., 0]))
+        lat_r = np.degrees(np.arcsin(np.clip(xyzr[..., 2], -1.0, 1.0)))
+        return lon_r, lat_r
 
-        for x, y in zip(lon_bnds, lat_bnds):
-            lons.append(np.mean(x))
-            lats.append(np.mean(y))
+    def _rot_to_geo(self, lon_rot_deg, lat_rot_deg):
+        """Vectorised rotated → geographic transform (degrees in, degrees out)."""
+        lon = np.radians(lon_rot_deg); lat = np.radians(lat_rot_deg)
+        x = np.cos(lat) * np.cos(lon)
+        y = np.cos(lat) * np.sin(lon)
+        z = np.sin(lat)
+        xyz = np.stack([x, y, z], axis=-1)
+        xyze = xyz @ self._r2g.T
+        lon_g = np.degrees(np.arctan2(xyze[..., 1], xyze[..., 0]))
+        lat_g = np.degrees(np.arcsin(np.clip(xyze[..., 2], -1.0, 1.0)))
+        return lon_g, lat_g
 
-        lons = [lon if lon<180 else lon-360 for lon in lons]
-        self.lons = lons
-        self.lats = lats
+    def _barycentric_rotated(self, pos, w1, w2, w3):
+        """
+        Combine a valid-element's three rotated vertices with barycentric
+        weights (w1,w2,w3) the same way FESOM's own point-in-triangle test
+        does (locbafu_2D in icb_elem.F90): each vertex/point is projected
+        through x_cart = cos(lat)*lon, y_cart = lat (its *own* lat, not a
+        shared reference), longitude is unwrapped across the +-180 seam
+        relative to vertex 1, and the combination is linear in that
+        projected space.  A naive linear combination directly in rotated
+        degrees (the old approach) agrees with this everywhere except close
+        to the mesh's rotated pole -- which for CORE2 (abg=[50,15,-90]) sits
+        over Greenland -- where it can produce a point FESOM's own search
+        does not consider inside the element, aborting with 'ICEBERG
+        OUTSIDE MODEL DOMAIN'.
+        """
+        lon1, lat1 = self._elon1[pos], self._elat1[pos]
+        lon2, lat2 = self._elon2[pos], self._elat2[pos]
+        lon3, lat3 = self._elon3[pos], self._elat3[pos]
+
+        def unwrap(lon, ref):
+            d = lon - ref
+            d = np.where(d > 180, d - 360, d)
+            d = np.where(d < -180, d + 360, d)
+            return ref + d
+
+        lon2 = unwrap(lon2, lon1)
+        lon3 = unwrap(lon3, lon1)
+
+        lat_rot = w1 * lat1 + w2 * lat2 + w3 * lat3
+        x_cart = (
+            w1 * np.cos(np.radians(lat1)) * lon1
+            + w2 * np.cos(np.radians(lat2)) * lon2
+            + w3 * np.cos(np.radians(lat3)) * lon3
+        )
+        lon_rot = x_cart / np.cos(np.radians(lat_rot))
+        return lon_rot, lat_rot
+
+    def _build_node_coord_arrays(self):
+        """
+        Build O(1) node-ID → rotated lon/lat lookup arrays from nod2d.out.
+
+        nod2d.out stores coordinates in the FESOM rotated frame, matching what
+        FESOM's point_in_triangle uses internally.  The KDTree and barycentric
+        position generation therefore work in rotated space; positions are
+        converted back to geographic (r2g) just before writing to icb_longitude.dat.
+        """
+        nids = self.nod2d.index.values.astype(int)   # 1-based
+        max_nid = int(nids.max())
+
+        self._nlon_arr = np.zeros(max_nid + 1, dtype=np.float64)
+        self._nlat_arr = np.zeros(max_nid + 1, dtype=np.float64)
+
+        self._nlon_arr[nids] = self.nod2d["lon"].values
+        self._nlat_arr[nids] = self.nod2d["lat"].values
+
+    def _build_valid_elem_set(self):
+        """
+        Compute self.valid_elem_idx: 0-based DataFrame indices of elements that
+        FESOM will accept for iceberg placement.
+
+        Mirrors FESOM icb_step.F90 exactly:
+            reject = all( cavity_depth(nodes) != 0  .OR.  bc_index_nod2D(nodes) == 0 )
+
+        i.e. an element is rejected when every one of its three nodes is either
+        inside a cavity (cavity_depth != 0) OR on a boundary edge (bc_index == 0).
+        A single interior non-cavity node is enough to keep the element.
+
+        bc_index_nod2D is computed from mesh topology in MOD_ICE.F90 (ice_init):
+          - All nodes start at bc_index = 1 (interior).
+          - Nodes belonging to boundary edges (edges shared by exactly one
+            element) are set to bc_index = 0.
+
+        cavity_depth is read from cavity_depth@node.out (one value per node).
+        """
+        n = len(self.elem2d)
+        nods = self.elem2d[["nod1", "nod2", "nod3"]].values.astype(int)  # (E, 3)
+        max_nid = int(self.nod2d.index.max())
+
+        # ── boundary-edge mask (matches FESOM bc_index_nod2D == 0) ───
+        e01 = np.sort(nods[:, [0, 1]], axis=1)
+        e12 = np.sort(nods[:, [1, 2]], axis=1)
+        e02 = np.sort(nods[:, [0, 2]], axis=1)
+        all_edges = np.vstack([e01, e12, e02])
+
+        edges_df = pd.DataFrame(all_edges, columns=["a", "b"])
+        edge_counts = edges_df.groupby(["a", "b"], sort=False).size()
+        boundary_edges = edge_counts[edge_counts == 1].reset_index()
+
+        boundary_node_ids = np.unique(boundary_edges[["a", "b"]].values.ravel())
+        boundary_arr = np.zeros(max_nid + 1, dtype=bool)
+        boundary_arr[boundary_node_ids] = True
+
+        # ── per-node cavity mask (cavity_depth != 0) ──────────────────
+        if self.bcavities and self._cavity_node_depth is not None:
+            cavity_node = self._cavity_node_depth != 0   # (max_nid+1,)
+        else:
+            cavity_node = np.zeros(max_nid + 1, dtype=bool)
+
+        # ── FESOM rejection: ALL nodes are (cavity OR boundary) ───────
+        invalid_node = cavity_node | boundary_arr
+        all_invalid = (
+            invalid_node[nods[:, 0]]
+            & invalid_node[nods[:, 1]]
+            & invalid_node[nods[:, 2]]
+        )
+
+        valid_mask = ~all_invalid
+        self.valid_elem_idx = self.elem2d.index.values[valid_mask]
+        self.valid_elem_idx_set = set(self.valid_elem_idx.tolist())
+
+        n_cav_elem = int((cavity_node[nods[:, 0]] & cavity_node[nods[:, 1]] & cavity_node[nods[:, 2]]).sum())
+        n_bnd_elem = int((boundary_arr[nods[:, 0]] & boundary_arr[nods[:, 1]] & boundary_arr[nods[:, 2]]).sum())
+        print(
+            f" * valid elements: {valid_mask.sum()} of {n} "
+            f"(all_invalid={all_invalid.sum()}, "
+            f"all_cavity={n_cav_elem}, all_boundary={n_bnd_elem})"
+        )
+
+    def _build_elem_tree(self):
+        """
+        KDTree on rotated element centroids for O(N log E) nearest-element
+        queries.  Also stores per-valid-element rotated vertex arrays for
+        vectorised barycentric position generation in rotated space.
+        """
+        ve = self.elem2d.loc[self.valid_elem_idx]
+        n1 = ve["nod1"].values.astype(int)
+        n2 = ve["nod2"].values.astype(int)
+        n3 = ve["nod3"].values.astype(int)
+
+        self._elon1 = self._nlon_arr[n1]
+        self._elat1 = self._nlat_arr[n1]
+        self._elon2 = self._nlon_arr[n2]
+        self._elat2 = self._nlat_arr[n2]
+        self._elon3 = self._nlon_arr[n3]
+        self._elat3 = self._nlat_arr[n3]
+
+        # Centroids as 3-D unit vectors: Euclidean distance is then monotonic in
+        # great-circle distance (a lon/lat-degree metric overweights east-west
+        # distance by 1/cos(lat), ~3-5x around Greenland).
+        cen = (
+            self._unit_xyz(self._elon1, self._elat1)
+            + self._unit_xyz(self._elon2, self._elat2)
+            + self._unit_xyz(self._elon3, self._elat3)
+        )
+        cen /= np.linalg.norm(cen, axis=1)[:, None]
+
+        self.elem_tree = KDTree(cen)
+
+        self._elem_pos_map = {
+            int(eidx): pos for pos, eidx in enumerate(self.valid_elem_idx)
+        }
+
+        print(f" * element KDTree built ({len(self.valid_elem_idx)} valid elements)")
+
+    def _build_neighbour_graph(self):
+        """
+        Build dict self.neighbours[elem_idx] → [neighbour_elem_idx, ...]
+        for elements sharing at least two nodes.  Restricted to valid elements.
+        """
+        ve = self.elem2d.loc[self.valid_elem_idx]
+        eidxs = ve.index.values
+        nods = ve[["nod1", "nod2", "nod3"]].values.astype(int)
+
+        node_to_pos: dict[int, list[int]] = {}
+        for pos, row_nods in enumerate(nods):
+            for nid in row_nods:
+                node_to_pos.setdefault(nid, []).append(pos)
+
+        self.neighbours: dict[int, list[int]] = {}
+        for pos, (eidx, row_nods) in enumerate(zip(eidxs, nods)):
+            cnt: dict[int, int] = {}
+            for nid in row_nods:
+                for other_pos in node_to_pos.get(nid, []):
+                    if other_pos != pos:
+                        cnt[other_pos] = cnt.get(other_pos, 0) + 1
+            self.neighbours[int(eidx)] = [
+                int(eidxs[p]) for p, c in cnt.items() if c >= 2
+            ]
+
+        print(f" * neighbour graph built ({len(self.neighbours)} entries)")
 
     def _read_basins_file(self):
         fl = xr.open_dataset(self.basin_file, decode_times=False)
         if "basin" in fl:
-            self.basins = fl.squeeze().basin
+            self.basins_da = fl.squeeze().basin
         elif "basins" in fl:
-            self.basins = fl.squeeze().basins
+            self.basins_da = fl.squeeze().basins
         else:
-            print("No basins in basin file")
-            return -1
-    
-    def _get_nearest_lon_lat(self, ds, lon, lat):
-        #https://stackoverflow.com/questions/58758480/xarray-select-nearest-lat-lon-with-multi-dimension-coordinates
-        abslat = np.abs(ds.lat-lat)
-        abslon = np.abs(ds.lon-lon)
-        c = np.maximum(abslon, abslat)
-    
-        ([yloc], [xloc]) = np.where(c == np.min(c))
-        point_ds = ds.isel(x=xloc, y=yloc)
-        return point_ds
+            raise KeyError(
+                "No 'basin' or 'basins' variable found in basin file"
+            )
 
-    def _find_basins(self):
-        basins = []
-        with tqdm(total=len(self.lons), file=sys.stdout, desc="find basins") as pbar:
-            for lon, lat in zip(self.lons, self.lats):
-                tmp = self._get_nearest_lon_lat(self.basins, lon, lat)
-                basins.append(int(tmp.squeeze().values))
-                pbar.update(1)
-        self.basins1D = basins
-
-    def _read_nod2d_file(self):
-        self.nod2d = pd.read_csv(self.nod2d_file, header=0, names=["lon", "lat", "coastal"], sep='\s+', index_col=0)
-        
-    def _read_elem2d_file(self):
-        self.elem2d = pd.read_csv(self.elem2d_file, header=0, names=["nod1", "nod2", "nod3"], sep='\s+')
-
-    def _read_cavity_elvls_file(self):
-        tmp = pd.read_csv(self.cavity_elvls_file, names=["cavity"], sep='\s+')
-        self.cavity_flags = tmp[tmp>1].notna()
+    def _build_basin_tree(self):
+        """KDTree on the basin grid for O(N log M) assignment."""
+        lons = self.basins_da.lon.values.ravel().astype(float)
+        lats = self.basins_da.lat.values.ravel().astype(float)
+        lons = np.where(lons > 180, lons - 360, lons)
+        self._basin_lons_flat = lons
+        self._basin_lats_flat = lats
+        self._basin_vals_flat = self.basins_da.values.ravel()
+        self.basin_tree = KDTree(np.column_stack([lons, lats]))
+        print(f" * basin KDTree built ({len(lons)} grid points)")
 
     def _get_full_cells(self):
-        df = pd.read_csv(self.latest_restart_file, header=None, delim_whitespace=True)
-        df_group  = df[[1,2,18,24]].groupby(18)
-        full_elems_tmp = []
+        """
+        Identify FESOM elements already saturated by icebergs in the restart.
+        self.full_elems is a set of 0-based element DataFrame indices.
+        Also fills self.elem_fill {0-based elem: iceberg area [m²]}, the
+        starting point of the running area budget used in generate_icebergs.
+        Restart columns: 1 length, 2 width [m], 18 element (1-based), 24 scaling.
+        """
+        full: set[int] = set()
+        fill: dict[int, float] = {}
+        rfile = self.latest_restart_file
+        if not (os.path.isfile(rfile) and os.path.getsize(rfile) > 0):
+            self.full_elems = full
+            self.elem_fill = fill
+            return
 
-        for felem in df_group:
-            if ((int(felem[0])==0) or ((int(felem[0])-1>len(self.mesh.voltri)))):
+        df = pd.read_csv(rfile, header=None, sep=r"\s+")
+        for felem_1based, grp in df[[1, 2, 18, 24]].groupby(18):
+            felem_1based = int(felem_1based)
+            if felem_1based == 0:
                 continue
-            ai = felem[1][1] * felem[1][2] * felem[1][24]
-            af = self.mesh.voltri[int(felem[0])-1]
-            if ai.sum() >= af:
-                print("*** FESOM element is full: ", felem[0])
-                print(" element area = ", af)
-                print(" iceberg area = ", ai)
-                full_elems_tmp.append(int(felem[0])-1)
-        self.full_elems = full_elems_tmp
+            idx0 = felem_1based - 1
+            if idx0 >= len(self.mesh.voltri):
+                continue
+            total_area = float((grp[1] * grp[2] * grp[24]).sum())
+            fill[idx0] = total_area
+            elem_area = self.mesh.voltri[idx0]
+            if total_area >= elem_area:
+                print(
+                    f"  * element full: {felem_1based} "
+                    f"(iceberg {total_area:.0f} m², elem {elem_area:.0f} m²)"
+                )
+                full.add(idx0)
 
-    def _remove_cavities(self):
-        print(" * remove cavity elements")
-        #self.elem2d = self.elem2d[~self.cavity_flags]
-        #self.elem2d = self.elem2d[~self.cavity_flags.values].reset_index()[["nod1", "nod2", "nod3"]]
-        self.elem2d = self.elem2d[~self.cavity_flags.values][["nod1", "nod2", "nod3"]]
-        print(" * list of good elements: ", self.elem2d.index.values[:])
+        self.full_elems = full
+        self.elem_fill = fill
 
-    def _find_FESOM_elem(self):
-        points = []
-        indices = []
-        neighbours = []
+    # ══════════════════════════════════════════════════════════════════
+    # Pipeline helpers
+    # ══════════════════════════════════════════════════════════════════
 
-        lon1 = self.nod2d.lon[self.elem2d.nod1]
-        lat1 = self.nod2d.lat[self.elem2d.nod1]
-        lon2 = self.nod2d.lon[self.elem2d.nod2]
-        lat2 = self.nod2d.lat[self.elem2d.nod2]
-        lon3 = self.nod2d.lon[self.elem2d.nod3]
-        lat3 = self.nod2d.lat[self.elem2d.nod3]
+    def _extract_valid_cells(self):
+        """
+        Single-pass filter → self.data / self.lons / self.lats (aligned).
+        self.lons and self.lats are geographic (from PISM lon_bnds/lat_bnds).
+        """
+        disch_flat = self.disch_field.values.ravel()
 
-        with tqdm(total=len(self.lons), file=sys.stdout, desc='find FESOM elements') as pbar:
-            for lon, lat in zip(self.lons, self.lats):
-                tmp, ind = PointTriangle_distance(lon, lat, 
-                                                np.array(lon1), np.array(lat1), 
-                                                np.array(lon2), np.array(lat2), 
-                                                np.array(lon3), np.array(lat3))
-                
-                points.append(tmp[:3])
-                indices.append(self.elem2d.index[ind])
-                pbar.update(1)
-        
-        self.points1D = points
-        self.indices1D = indices
+        lb = self.fl.lon_bnds.values
+        la = self.fl.lat_bnds.values
+        lon_center = lb.reshape(-1, 4).mean(axis=1)
+        lat_center = la.reshape(-1, 4).mean(axis=1)
+        lon_center = np.where(lon_center > 180, lon_center - 360, lon_center)
 
-    def _get_FESOM_neighbours(self, ind):
-        points = []
-        indices = []
+        if len(disch_flat) != len(lon_center):
+            raise ValueError(
+                f"disch_field has {len(disch_flat)} cells but "
+                f"lon_bnds implies {len(lon_center)} — check PISM file dimensions"
+            )
 
-        tmp = self.elem2d.loc[((self.elem2d["nod1"].isin(self.elem2d.loc[ind].values)) & (self.elem2d["nod2"].isin(self.elem2d.loc[ind].values))) | \
-                        ((self.elem2d["nod1"].isin(self.elem2d.loc[ind].values)) & (self.elem2d["nod3"].isin(self.elem2d.loc[ind].values))) | \
-                        ((self.elem2d["nod2"].isin(self.elem2d.loc[ind].values)) & (self.elem2d["nod3"].isin(self.elem2d.loc[ind].values)))]
-   
-        indices = list(tmp[tmp.index != ind].index)
-        return indices
+        mask = np.isfinite(disch_flat) & (disch_flat < self.min_disch_in_cell)
+        self.data = disch_flat[mask]
+        self.lons = lon_center[mask]
+        self.lats = lat_center[mask]
+        print(f" * valid calving cells: {mask.sum()}")
 
+    def _assign_basins(self):
+        """O(N log M) basin assignment via KDTree."""
+        _, idx = self.basin_tree.query(
+            np.column_stack([self.lons, self.lats])
+        )
+        self.basins1D = self._basin_vals_flat[idx].astype(int)
+
+    def _assign_fesom_elems(self):
+        """
+        O(N log E) FESOM element assignment via KDTree on rotated centroids.
+        PISM calving positions are geographic; convert to rotated before querying
+        so the nearest-element search matches FESOM's point_in_triangle frame.
+        """
+        lons_rot, lats_rot = self._geo_to_rot(self.lons, self.lats)
+        _, idx = self.elem_tree.query(self._unit_xyz(lons_rot, lats_rot))
+        self.elem_ids = self.valid_elem_idx[idx]
+
+    @staticmethod
+    def _unit_xyz(lon_deg, lat_deg):
+        """lon/lat in degrees -> (N, 3) unit vectors."""
+        lon = np.radians(np.asarray(lon_deg, dtype=float))
+        lat = np.radians(np.asarray(lat_deg, dtype=float))
+        return np.column_stack([
+            np.cos(lat) * np.cos(lon),
+            np.cos(lat) * np.sin(lon),
+            np.sin(lat),
+        ])
+
+    # ══════════════════════════════════════════════════════════════════
+    # Iceberg size generation  (unchanged from v2)
+    # ══════════════════════════════════════════════════════════════════
 
     def _create_icebergs_within_basin(self, df, idx):
-    ######################################
-    # input:    data frame for one basin: discharge and FESOM cell corners (p1, p2, p3)
-    # output:   iceberg volume array
-    ######################################
-        # maximal time in seconds to wait for iceberg generation to finish (for one basin)
+        """
+        Generate a DataFrame of individual iceberg areas/volumes for one basin.
+        Returns -1 on timeout (caller should retry), empty DataFrame if no
+        calving, otherwise a DataFrame with columns [area, volume, bin].
+        """
         dtime_MAX = 30
-        
-        # mu and sigma for lognormal distribution after Tournadre et al. (2011)
-        mu, sigma = 12.3, 1.55**0.5
-        xmin = self.area_min
-   
-        ############################################################
+
         if self.domain.lower() == "sh":
-            # Southern Hemisphere: alpha for powerlaw after Tournadre et al. (2015) 
             a = 1.52
         elif self.domain.lower() == "greenland":
-            # Greenland: alpha for powerlaw after Shiggins et al. (2023)
-            if idx == 3:    # SKJI and UI
-                a = 2.02
-            elif idx == 5:  # KNS
-                a = 2.38
-            else:
-                a = 2.2 
+            a = {3: 2.02, 5: 2.38}.get(idx, 2.2)
         else:
-            a, xmin = 1.52, 0.01
-        print(" * domain is {}, using alpha={} for basin {}".format(self.domain, a, idx))
-        ############################################################
+            a = 1.52
+        xmin = self.area_min
 
+        print(f" * domain={self.domain}, alpha={a:.2f}, basin={idx}")
 
-        median = 2**(1/(a-1))*xmin
-
-        # get values within basin
-        vals = abs(df.disch)
-    
-        # get total discharge within basin in [km3 year-1]
-        disch_tot = vals / 1e9
-    
-        # get total iceberg area within basin in [km2 year-1]
-        # assuming constant iceberg height
+        median = 2 ** (1.0 / (a - 1.0)) * xmin
+        disch_tot = abs(float(df.disch)) / 1e9   # km³/year
         area_tot = disch_tot / self.thick_max
-    
-        # create iceberg areas according to Tournadre et al. (2015)
-        # divide icebergs into classes of different area sizes (0.1-1, 1-10, 10-100, ... [km2])
-        # and draw from powerlaw distribution with alpha=1.52 except for the icebergs from
-        # smallest class. Get total number of icebergs with share of smallest class (WEIGHTS_N)
-        # and mean size within smalles class (SMEAN_1). Get number of icebergs of each other class
-        # with corresponding share. 
         N = int(area_tot / median)
-
-        # generates random variates of power law distribution
-        vrs = powerlaw.Power_Law(xmin=xmin, xmax=self.area_max, parameters=[a]).generate_random(N)
-
-        x = vrs
-        corr = area_tot / sum(x)
-        
-        x = x * corr
-
-        # correction with respect to iceberg volume and not iceberg area
-        thick = x**(1/2)
-        thick[thick>self.thick_max] = self.thick_max
-        vol = x * thick
-        corr = disch_tot / sum(vol) 
-        #corr = area_tot / sum(x)
-        
-        x = x * corr
-        
-        # correction with respect to iceberg volume and not iceberg area
-        thick = x**(1/2)
-        thick[thick>self.thick_max] = self.thick_max
-        vol = x * thick
-        vol_sum_0 = sum(vol)
-        #x_sum_0 = sum(x)
-        
-        x = x[x>=xmin]
-        x = x[x<=self.area_max]
-        if sum(x) == 0:
-            print(" * no icebegs")
+        if N == 0:
             return pd.DataFrame()
-        
-        # correction with respect to iceberg volume and not iceberg area
-        thick = x**(1/2)
-        thick[thick>self.thick_max] = self.thick_max
+
+        vrs = powerlaw.Power_Law(
+            xmin=xmin, xmax=self.area_max, parameters=[a]
+        ).generate_random(N)
+        x = vrs * (area_tot / vrs.sum())
+
+        thick = np.minimum(np.sqrt(x), self.thick_max)
         vol = x * thick
-        vol_sum_1 = sum(vol)
-        #x_sum_1 = sum(x)
-        corr = vol_sum_0 / vol_sum_1
-        #corr = x_sum_0 / x_sum_1
-        x = x * corr
+        vol_sum_0 = float(vol.sum())
+
+        x = x[(x >= xmin) & (x <= self.area_max)]
+        if x.sum() == 0:
+            return pd.DataFrame()
+
+        thick = np.minimum(np.sqrt(x), self.thick_max)
+        vol_sum_1 = float((x * thick).sum())
+        if vol_sum_1 > 0:
+            x = x * (vol_sum_0 / vol_sum_1)
 
         x_tot = x
         tstart = time.time()
-        while N > 0:
-            N = int((vol_sum_0 - vol_sum_1) / vol_sum_0 * N)
-            print(" N = ", str(N))
-            if N==0:
-                break
-            vrs = powerlaw.Power_Law(xmin=xmin, xmax=self.area_max, parameters=[a]).generate_random(N)
-            x = vrs
-            x_too_small = x[x<xmin]
-            x_too_large = x[x>self.area_max]
-            x = x[x>=xmin]
-            x = x[x<=self.area_max]
-            x_tot = np.concatenate([x_tot, x])
-            if sum(x_tot) == 0:
-                print(" * no icebegs")
-                return pd.DataFrame()
-        
-            # correction with respect to iceberg volume and not iceberg area
-            thick = x_tot**(1/2)
-            thick[thick>self.thick_max] = self.thick_max
-            vol = x_tot * thick
-            corr = disch_tot / sum(vol)
-            #corr = area_tot / sum(x_tot)
-            x_tot = x_tot * corr
-            tend = time.time()
-            dtime = tend - tstart
-            if dtime >= dtime_MAX:
-                print("elapsed time = ", str(tend - tstart))
-                print("start iceberg generation again for this basin")
-                return -1
-            
-        # correction with respect to iceberg volume and not iceberg area
-        vol = x_tot * thick
 
-        area = x_tot
-        bins = np.digitize(area, self.bins, right=True)
-
-        #for a, b in zip(area, bins):
-        #    vol = np.concatenate([vol, [a * self.thick[b]]])
-
-        # create data frame with iceberg elements: area, volume, bin
-        ib_elems = pd.DataFrame({"area": area, 
-                                "volume": vol,
-                                "bin": np.digitize(area, self.bins, right=True)})
-       
-        ib_elems_ = ib_elems.where(ib_elems.area >= self.area_min).dropna()
-    
-#        print("*** Check for validity:")
-#        print("***      assumed iceberg thickness [km]:         ", self.thick)
-#        print("***      total discharge [km3 year-1]:        ", disch_tot)
-#        print("***      summed iceberg volume [km3]:         ", sum(ib_elems.volume))
-#        print("***      summed iceberg volume [km3]:         ", sum(ib_elems_.volume))
-#        print("***      total iceberg area [km2 year-1]:     ", area_tot)
-#        print("***      summed area (of generated ib) [km2]: ", sum(ib_elems.area)) 
-#        print("***      summed area (of generated ib) [km2]: ", sum(ib_elems_.area)) 
-#        print("***      total number of icebergs:            ", len(ib_elems))
-#        print("***      total number of icebergs:            ", len(ib_elems_))
-#        print(ib_elems_)
-        return ib_elems_
-
-
-    def __create_icebergs_within_basin(self, df):
-    ######################################
-    # input:    data frame for one basin: discharge and FESOM cell corners (p1, p2, p3)
-    # output:   iceberg volume array
-    ######################################
-        # mu and sigma for lognormal distribution after Tournadre et al. (2011)
-        mu, sigma = 12.3, 1.55**0.5
-   
-        # alpha for powerlaw after Tournadre et al. (2015)
-        a, xmin = 1.52, 0.1
-        C = (a - 1) / xmin * xmin ** (a - 1)
-
-        # get values within basin
-        vals = abs(df.disch)
-    
-        # get total discharge within basin in [km3 year-1]
-        disch_tot = vals / 1e9
-    
-        # get total iceberg area within basin in [km2 year-1]
-        # assuming constant iceberg height
-        area_tot = disch_tot / self.thick.mean()
-    
-        # create iceberg areas according to Tournadre et al. (2015)
-        # divide icebergs into classes of different area sizes (0.1-1, 1-10, 10-100, ... [km2])
-        # and draw from powerlaw distribution with alpha=1.52 except for the icebergs from
-        # smallest class. Get total number of icebergs with share of smallest class (WEIGHTS_N)
-        # and mean size within smalles class (SMEAN_1). Get number of icebergs of each other class
-        # with corresponding share. 
-       
-        print("*** Total area [km2] = ", area_tot)
-        if area_tot > self.area_max:
-            area = np.array([np.random.uniform(self.bins[-1], self.area_max)])
-            vol = area * self.thick[-1]
-            print("*** Total area too big. Calving of giant iceberg with area [km2] = ", area)
-            area_tot_new = area_tot - area
-        else:
-            area = 0
-            print("*** Total area okay")
-            area_tot_new = area_tot
-
-        stop_iceberg_generation = False
-        for i, (wa, wn) in enumerate(zip(self.weights_area, self.weights_dist)):
-            print("*** Bin Number ", str(i))
-            if i==0:
-                # get amount of icebergs of smalles class
-                N = int(area_tot_new * wa / self.area_mean[i])
-                # get total amount of icebergs
-                N_tot = int(N / wn)
-                print("N_tot = ", N_tot)
-                # draw area sizes from lognormal distribution for smalles iceberg class
-                #tmp = np.random.lognormal(mu, sigma, N)
-                tmp = C * powerlaw.Power_Law(xmin=xmin, parameters=[a]).generate_random(N)
-                # get scaling factor to sum iceberg areas up to actual share of discharge (wa * area_tot)
-                if N == N_tot:
-                    f = area_tot_new / sum(tmp)
-                else:
-                    f = wa * area_tot_new / sum(tmp)
-                area_new = tmp * f
-                vol_new = area_new * self.thick[i]
-                
-                if area == 0:
-                    area = area_new
-                    vol = vol_new
-                else:
-                    print(" *** AREA = ", area)
-                    area = np.concatenate((area, area_new), axis=0)
-                    vol = np.concatenate((vol, vol_new), axis=0)
-            
+        while True:
+            thick = np.minimum(np.sqrt(x_tot), self.thick_max)
+            vol_sum_1 = float((x_tot * thick).sum())
+            if vol_sum_0 > 0:
+                N = int((vol_sum_0 - vol_sum_1) / vol_sum_0 * len(x_tot))
             else:
-                # get amount of icebergs of class
-                N = math.ceil(area_tot_new * wa / self.area_mean[i])
-                if N == 0:
-                    continue
-                    #N = 1
-                    stop_iceberg_generation = True
-                
-                #tmp = np.random.lognormal(mu, sigma, N)
-                # generates random variates of power law distribution
-                tmp = C * powerlaw.Power_Law(xmin=xmin, parameters=[a]).generate_random(N)
+                N = 0
+            if N <= 0:
+                break
+            if time.time() - tstart >= dtime_MAX:
+                print(
+                    f" * timeout ({time.time()-tstart:.1f}s) "
+                    f"for basin {idx}, retrying"
+                )
+                return -1
+            vrs = powerlaw.Power_Law(
+                xmin=xmin, xmax=self.area_max, parameters=[a]
+            ).generate_random(N)
+            new = vrs[(vrs >= xmin) & (vrs <= self.area_max)]
+            x_tot = np.concatenate([x_tot, new])
+            if x_tot.sum() == 0:
+                return pd.DataFrame()
+            thick = np.minimum(np.sqrt(x_tot), self.thick_max)
+            vol_sum_1 = float((x_tot * thick).sum())
+            if vol_sum_1 > 0:
+                x_tot = x_tot * (disch_tot / vol_sum_1)
 
-                if stop_iceberg_generation:
-                    f = sum(self.weights_area[i:]) * area_tot_new / sum(tmp)
+        # Exact volume closure: total iceberg volume must equal the PISM discharge
+        # (disch_tot). The loop above targets vol_sum_0, which is smaller than
+        # disch_tot because small bergs are thinner than thick_max
+        # (thick = sqrt(area)), so without this step 20-30 % of the discharge
+        # was lost. Volume is nonlinear in area (area**1.5 below thick_max**2),
+        # so solve for the area factor f by bisection; repeat if rescaling pushes
+        # bergs below area_min (they are dropped in the return below).
+        x_tot = x_tot[x_tot >= xmin]
+        for _ in range(5):
+            if x_tot.size == 0:
+                return pd.DataFrame()
+
+            def _vol(f):
+                xf = f * x_tot
+                return float((xf * np.minimum(np.sqrt(xf), self.thick_max)).sum())
+
+            lo, hi = 1e-3, 1e3
+            for _ in range(100):
+                mid = 0.5 * (lo + hi)
+                if _vol(mid) < disch_tot:
+                    lo = mid
                 else:
-                    f = wa * area_tot_new / sum(tmp)
-                area_new = tmp * f
-                vol_new = area_new * self.thick[i]
-                area = np.concatenate((area, area_new), axis=0)
-                vol = np.concatenate((vol, vol_new), axis=0)
-   
-            if stop_iceberg_generation:
-                print("*** No further icebergs are generated")
-                continue
+                    hi = mid
+            x_tot = x_tot * 0.5 * (lo + hi)
+            if (x_tot >= xmin).all():
+                break
+            x_tot = x_tot[x_tot >= xmin]
 
-        ## break down all iceberg with surface area greater than SMAX [km2] into smaller icebergs
-        #while len(area[area > self.area_max] > 0):
-        #    tmp = np.where(area > self.area_max)
-        #    area[tmp] = area[tmp]/2
-        #    area = np.append(area, area[tmp])
-    
-        # create data frame with iceberg elements: area, volume, bin
-        ib_elems = pd.DataFrame({"area": area, 
-                                "volume": vol,
-                                "bin": np.digitize(area, self.bins, right=True)})
-       
-        ib_elems_ = ib_elems.where(ib_elems.area >= self.area_min).dropna()
-    
-#        print("*** Check for validity:")
-#        print("***      assumed iceberg thickness [km]:         ", self.thick)
-#        print("***      total discharge [km3 year-1]:        ", disch_tot)
-#        print("***      summed iceberg volume [km3]:         ", sum(ib_elems.volume))
-#        print("***      summed iceberg volume [km3]:         ", sum(ib_elems_.volume))
-#        print("***      total iceberg area [km2 year-1]:     ", area_tot)
-#        print("***      summed area (of generated ib) [km2]: ", sum(ib_elems.area)) 
-#        print("***      summed area (of generated ib) [km2]: ", sum(ib_elems_.area)) 
-#        print("***      total number of icebergs:            ", len(ib_elems))
-#        print("***      total number of icebergs:            ", len(ib_elems_))
-#        print(ib_elems_)
-        return ib_elems_
+        thick = np.minimum(np.sqrt(x_tot), self.thick_max)
+        return pd.DataFrame({
+            "area":   x_tot,
+            "volume": x_tot * thick,
+            "bin":    np.digitize(x_tot, self.bins, right=True),
+        }).query("area >= @self.area_min").reset_index(drop=True)
 
     def _scale_icebergs(self, df):
-    ######################################
-    # input:    data frame: area, volume, bin
-    # output:   data frame: length, scaling, depth
-    ######################################
-        # loop over all bins
-        with tqdm(total=len(self.scaling_factor), file=sys.stdout, desc='go through all bins') as pbar:
-            for i, (s, d) in enumerate(zip(self.scaling_factor, self.thick)):
-                
-                # get icb elements of particular size class
-                ib_bin = df.where(df.bin==i).dropna()
-       
-                if not ib_bin.empty:
-                    # split iceberg array of size class into chunks with length s
-                    chunks = np.array_split(ib_bin, math.ceil(len(ib_bin)/s))
-                    # get mean of each chunk
-                    chunks_mean_area = np.array([chunk.area.mean(axis=0) for chunk in chunks])
-                    chunks_mean_volume = np.array([chunk.volume.mean(axis=0) for chunk in chunks])
-    
-                    # check if arrays are initialized
-                    if not 'length' in locals():
-                        # get mean length of icebergs for each chunk
-                        length = ne.evaluate('chunks_mean_area**(1/2)')
-                        # get scaling factor (length of each chunk)
-                        scaling = np.array([len(chunk) for chunk in chunks])
-                        # get mean height of icebergs for each chunk
-                        depth = ne.evaluate('chunks_mean_volume / chunks_mean_area')
-                        ## get depth
-                        #depth = np.array([d] * len(chunks))
-    
-                    else:
-                        # get mean length of icebergs for each chunk
-                        length = np.append(length, ne.evaluate('chunks_mean_area**(1/2)'))
-                        # get scaling factor (length of each chunk)
-                        scaling = np.append(scaling, np.array([len(chunk) for chunk in chunks]))
-                        # get mean height of icebergs for each chunk
-                        depth = np.append(depth, ne.evaluate('chunks_mean_volume / chunks_mean_area'))
-                        ## get depth
-                        #depth = np.append(depth, np.array([d] * len(chunks)))
-                    pbar.update(1)
-                else:
-                    print("*** bin is empty")
-                    pbar.update(1)
-        
-        # create data frame with scaled iceberg elements: length, scaling, depth
-        df_out = pd.DataFrame({"length": length,
-                                "scaling": scaling,
-                                "depth": depth})
-        
-#        print("*** Check for validity:")
-#        print("***      BEFORE SCALING:")
-#        print("***      total iceberg area [km2]:   ", df.sum(axis=0).area)
-#        print("***      total iceberg volume [km3]: ", df.sum(axis=0).volume)
-#        print("***      total amount of icebergs:   ", len(df))
-#        print("***      AFTER SCALING:")
-#        print("***      total iceberg area [km2]:   ", np.sum(df_out.length * df_out.length * df_out.scaling))
-#        print("***      total iceberg volume [km3]: ", np.sum(df_out.length * df_out.length * df_out.scaling * df_out.depth))
-#        print("***      total amount of icebergs:   ", np.sum(df_out.scaling))
-#        print("***      total am. of sim. icebergs: ", len(df_out))
-        return df_out
-    
-    #generate icebergs
-    def _icb_generator(self, fmode="w"):
-        ###############################
-        # bisher verwendet!
-        mu, sigma = 12.3, 1.55**0.5     #Tournadre et al. 2011
-        a = 1.52
-    
-        ib_elems_scaled = pd.DataFrame()
-        ib_elems_loc = pd.DataFrame()
-    
-        points = []
-        height = [] #height=depth*8/7=length*8/7*2/3=length*16/21
-    
-        with tqdm(total=len(self.df_agg), file=sys.stdout, desc='go through basins') as pbar:
-            for index in self.df_agg.index:
-                # inner loop to enable redo if generation of icebergs takes too long
-                # https://stackoverflow.com/questions/36573486/redo-for-loop-iteration-in-python
-                while True:
-                    b = self.df_agg.loc[index]
-                    print("*****************************")
-                    print("*** BASIN = ", index)
+        """
+        Aggregate individual icebergs into scaled representative objects.
+        """
+        length_out, scaling_out, depth_out = [], [], []
 
-                    # create icebergs for basin [m3]
-                    ib_tmp = self._create_icebergs_within_basin(b, idx=index)
-                    if isinstance(ib_tmp, int):
-                        if ib_tmp == -1:
-                            continue            # equivalent to redo
-                    elif ib_tmp.empty:
-                        break                   # now equivalent to continue
-                    ib_elems = self._scale_icebergs(ib_tmp)
+        for i in sorted(df["bin"].unique()):
+            ib_bin = df[df["bin"] == i].dropna()
+            if ib_bin.empty:
+                continue
+            if i < len(self.scaling_factor):
+                s = max(1, int(self.scaling_factor[i]))
+            else:
+                # bin beyond the scaling list (area > bins[-1] km²): keep the
+                # bergs individually instead of dropping them
+                print(
+                    f"  * WARNING: {len(ib_bin)} bergs in size bin {i} without "
+                    f"scaling factor; using scaling 1"
+                )
+                s = 1
+            chunks = np.array_split(ib_bin, math.ceil(len(ib_bin) / s))
+            for chunk in chunks:
+                ma = float(chunk["area"].mean())
+                mv = float(chunk["volume"].mean())
+                if ma <= 0:
+                    continue
+                length_out.append(float(np.sqrt(ma)))
+                depth_out.append(mv / ma)
+                scaling_out.append(len(chunk))
 
-                    # make list of fesom elements and it's neighbours
-                    felems = list(b.elems)
-                    if not self.bcavities:
-                        for n in b["neigh."]:
-                            felems = felems + list(n)
-                    felems = list(set(felems))
-  
-                    ##############################################################
-                    # exclude coastal nodes (and full cells)
-                    elems_to_drop = self.full_elems
-                
-                    for felem in felems:
-                        nodes = self.elem2d.loc[felem].values
-                        coastal = False
-                        for node in nodes:
-                            lon, lat, tmp = self.nod2d.loc[node]
-                            if (tmp == 1 or coastal == 1):
-                                coastal = True
-                    
-                        if coastal == 1:
-                            elems_to_drop.append(felem)
+        if not length_out:
+            return pd.DataFrame()
 
-                    #print(" * drop these element indices: ", elems_to_drop) 
-                    new_felems = [elem for elem in felems if elem not in elems_to_drop]
-                    felems = new_felems
-                    ##############################################################
-
-                    if len(felems) != 0:
-                        tmp = felems * int(len(ib_elems) / len(felems)) + felems[:len(ib_elems)%len(felems)]
-                        felems = tmp
-   
-                        with tqdm(total=len(self.df_agg), file=sys.stdout, desc='initialize icebergs') as pbar:
-                            for felem, index in zip(felems, ib_elems.index):
-                                ib_elem = ib_elems.loc[index]
-                                
-                                nod1, nod2, nod3 = self.elem2d.loc[felem].values
-                                lon1, lat1, tmp = self.nod2d.loc[nod1].values
-                                lon2, lat2, tmp = self.nod2d.loc[nod2].values
-                                lon3, lat3, tmp = self.nod2d.loc[nod3].values
-
-                                r1 = random.rand()
-                                r2 = random.rand()
-                                
-                                lower_bound = 0.25
-                                upper_bound = 0.75
-    
-                                r1 = r1 * (upper_bound - lower_bound) + lower_bound
-                                r2 = r2 * (upper_bound - lower_bound) + lower_bound
-                                #https://math.stackexchange.com/questions/18686/uniform-random-point-in-triangle
-                                try:
-                                    lon = (1-np.sqrt(r1))*lon1 + (np.sqrt(r1)*(1-r2))*lon2 + (r2*np.sqrt(r1))*lon3
-                                    lat = (1-np.sqrt(r1))*lat1 + (np.sqrt(r1)*(1-r2))*lat2 + (r2*np.sqrt(r1))*lat3
-                                except:
-                                    continue
-                               
-                                if ib_elems_loc.empty:
-                                    ib_elems_loc = pd.DataFrame({"length": [ib_elem.length], 
-                                                                "depth": [ib_elem.depth],
-                                                                "scaling": [ib_elem.scaling],
-                                                                "lon": [lon], "lat": [lat],
-                                                                "felem": [felem]})
-                                else:
-                                    ib_elems_loc = pd.concat([ib_elems_loc, pd.DataFrame({"length": [ib_elem.length], 
-                                                                                        "depth": [ib_elem.depth],
-                                                                                        "scaling": [ib_elem.scaling],
-                                                                                        "lon": [lon], "lat": [lat],
-                                                                                        "felem": [felem]})])
-                                pbar.update(1)
-                    pbar.update(1)
-                    break
-
-        if not ib_elems_loc.empty:
-            with open(os.path.join(self.icb_path, "icb_longitude.dat"), fmode) as f:
-                np.savetxt(f, ib_elems_loc.lon.values)
-                f.close()
-            with open(os.path.join(self.icb_path, "icb_latitude.dat"), fmode) as f:
-                np.savetxt(f, ib_elems_loc.lat.values)
-                f.close()
-            with open(os.path.join(self.icb_path, "icb_length.dat"), fmode) as f:
-                np.savetxt(f, ib_elems_loc.length.values * 1e3)
-                f.close()
-            with open(os.path.join(self.icb_path, "icb_height.dat"), fmode) as f:
-                np.savetxt(f, ib_elems_loc.depth.values * 1e3)
-                f.close()
-            with open(os.path.join(self.icb_path, "icb_scaling.dat"), fmode) as f:
-                np.savetxt(f, ib_elems_loc.scaling.values)
-                f.close()
-            with open(os.path.join(self.icb_path, "icb_felem.dat"), fmode) as f:
-                np.savetxt(f, ib_elems_loc.felem.values)
-                f.close()
+        return pd.DataFrame({
+            "length":  length_out,
+            "depth":   depth_out,
+            "scaling": scaling_out,
+        })
 
 
+# ══════════════════════════════════════════════════════════════════════
+# Module-level helpers kept for backward compatibility
+# ══════════════════════════════════════════════════════════════════════
+
+import sys  # noqa: E402
 
 
+class _Point:
+    __slots__ = ("x", "y")
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-class point:
     def __init__(self, x, y):
         self.x = x
         self.y = y
-    def to_dict(self):
-        return {'x': self.x, 'y': self.y}
 
 
-# https://stackoverflow.com/questions/2049582/how-to-determine-if-a-point-is-in-a-2d-triangle
-def sign(p1, p2, p3):
+def _sign(p1, p2, p3):
     return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y)
 
-def PointInTriangle(pt, v1, v2, v3):
-    d1 = sign(pt, v1, v2)
-    d2 = sign(pt, v2, v3)
-    d3 = sign(pt, v3, v1)
 
+def PointInTriangle(pt, v1, v2, v3):
+    d1 = _sign(pt, v1, v2)
+    d2 = _sign(pt, v2, v3)
+    d3 = _sign(pt, v3, v1)
     has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
     has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
-
     return not (has_neg and has_pos)
-
-def PointTriangle_distance(lon0, lat0, lon1, lat1, lon2, lat2, lon3, lat3):
-    d1 = ne.evaluate('(lon1 - lon0)**2 + (lat1 - lat0)**2')
-    d2 = ne.evaluate('(lon2 - lon0)**2 + (lat2 - lat0)**2')
-    d3 = ne.evaluate('(lon3 - lon0)**2 + (lat3 - lat0)**2')
-    
-    dis = d1+d2+d3
-    ind = np.where(dis == np.amin(dis))
-   
-    p1 = point(lon1[ind], lat1[ind])
-    p2 = point(lon2[ind], lat2[ind])
-    p3 = point(lon3[ind], lat3[ind])
-
-    return [p1, p2, p3], ind[0][0]
