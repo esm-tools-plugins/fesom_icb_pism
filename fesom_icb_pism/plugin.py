@@ -72,6 +72,13 @@ def update_icebergs(config):
         print(" * use scaling factors ", scaling_factor)
         bcavities = config["fesom"].get("use_cav", False)
 
+        # calving input: "pism" (PISM discharge, default) or "fesom" (FESOM
+        # cavity freshwater flux); mesh_diag_file defaults to
+        # <mesh_dir>/fesom.mesh.diag.nc (only used for "fesom")
+        input_type = config["fesom"].get("icb_input_type", "pism")
+        mesh_diag_file = config["fesom"].get("mesh_diag_file")
+        print(f" * icb_input_type = {input_type}")
+
         if config["fesom"].get("rotate", False):
             abg = [50, 15, -90]
         else:
@@ -110,6 +117,8 @@ def update_icebergs(config):
                     domain=dom,
                     bcavities=bcavities,
                     abg=abg,
+                    input_type=input_type,
+                    mesh_diag_file=mesh_diag_file,
                 )
                 ib.create_distribution()
                 ib.generate_icebergs(fmode=fmode)
@@ -127,6 +136,8 @@ def update_icebergs(config):
                 domain=config["fesom"].get("domain", "sh"),
                 bcavities=bcavities,
                 abg=abg,
+                input_type=input_type,
+                mesh_diag_file=mesh_diag_file,
             )
             ib.create_distribution()
             ib.generate_icebergs(fmode="w")

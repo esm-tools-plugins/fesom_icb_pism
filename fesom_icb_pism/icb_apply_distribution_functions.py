@@ -78,6 +78,8 @@ class IcebergCalving:
         bcavities=True,
         ibareamax=400,
         domain="SH",
+        input_type="pism",
+        mesh_diag_file=None,
     ):
         if abg is None:
             abg = [50, 15, -90]
@@ -89,6 +91,15 @@ class IcebergCalving:
         print(f" * seed        = {seed}")
         print(f" * bcavities   = {bcavities}")
         print(f" * domain      = {domain}")
+        print(f" * input_type  = {input_type}")
+
+        # input: "pism" (PISM discharge) or "fesom" (FESOM cavity
+        # freshwater flux, converted to icebergs)
+        self.input_type = input_type
+        # fesom.mesh.diag.nc (node areas, lon/lat), only used for input_type="fesom"
+        self.mesh_diag_file = mesh_diag_file or os.path.join(
+            mesh_path, "fesom.mesh.diag.nc"
+        )
 
         # paths
         self.ifile = ifile
@@ -105,6 +116,7 @@ class IcebergCalving:
         # physical / numerical settings
         self.name_of_discharge = "tendency_of_ice_amount_due_to_discharge"
         self.rho_ice = 850
+        self.rho_water = 1000
         self.bins = [0.1, 1, 10, 100, 1000]
         self.weights_area = [0.0005, 0.008, 0.025, 0.074, 0.893]
         self.weights_dist = [0.75, 0.175, 0.05, 0.02, 0.005]
@@ -117,10 +129,20 @@ class IcebergCalving:
         self.domain = domain
         self.bcavities = bcavities
 
-        # ── read PISM discharge ────────────────────────────────────────
-        self._read_pism_file()
-        self._get_pism_resolution()
-        self._convert_to_kg_m2_year1()
+        # ── read calving input ─────────────────────────────────────────
+        if self.input_type == "pism":
+            self._read_pism_file()
+            self._get_pism_resolution()
+            self._convert_to_kg_m2_year1()
+        elif self.input_type == "fesom":
+            self._read_fesom_fw_file()
+            self._apply_cavity_mask()
+            self._convert_fesom_to_m3_year()
+            self._get_fesom_coords()
+        else:
+            raise ValueError(
+                f"Unknown input_type: {input_type}. Must be 'pism' or 'fesom'."
+            )
 
         # ── read FESOM mesh ────────────────────────────────────────────
         self._read_mesh()          # pf.load_mesh → mesh.voltri for _get_full_cells
@@ -165,15 +187,23 @@ class IcebergCalving:
 
     def create_distribution(self):
         """
-        Filter PISM cells, assign basins and FESOM elements, build df_agg.
+        Filter calving cells, assign basins and FESOM elements, build df_agg.
         Must be called before generate_icebergs().
         """
-        self._extract_valid_cells()
+        if self.input_type == "pism":
+            # kg m-2 yr-1 -> m³/yr ice
+            self._extract_valid_cells()
+            disch = self.data * self.res * self.res / self.rho_ice
+        else:
+            # FESOM: self.data/lons/lats set in __init__; m³/yr water -> m³/yr ice
+            disch = self.data * (self.rho_water / self.rho_ice)
+        print(f" * total ice volume flux: {np.sum(disch) * 1e-9:.2f} km3/year")
+
         self._assign_basins()
         self._assign_fesom_elems()
 
         self.df = pd.DataFrame({
-            "disch": self.data * self.res * self.res / self.rho_ice,  # m³/year
+            "disch": disch,  # m³/year ice
             "elem":  self.elem_ids,
             "basin": self.basins1D,
         }).dropna()
@@ -294,17 +324,18 @@ class IcebergCalving:
             print(f" * no icebergs generated (files written empty, mode '{fmode}')")
         os.makedirs(self.icb_path, exist_ok=True)
 
-        def _save(fname, arr):
+        def _save(fname, arr, fmt="%.18e"):
             path = os.path.join(self.icb_path, fname)
             with open(path, fmode) as f:
-                np.savetxt(f, arr)
+                np.savetxt(f, arr, fmt=fmt)
 
         _save("icb_longitude.dat", out["lon"].values)
         _save("icb_latitude.dat",  out["lat"].values)
         _save("icb_length.dat",    out["length"].values * 1e3)   # km → m
         _save("icb_height.dat",    out["depth"].values  * 1e3)   # km → m
-        _save("icb_scaling.dat",   out["scaling"].values)
-        _save("icb_felem.dat",     out["felem"].values)
+        # integers: FESOM reads scaling into an INTEGER array
+        _save("icb_scaling.dat",   out["scaling"].values.astype(int), fmt="%d")
+        _save("icb_felem.dat",     out["felem"].values.astype(int), fmt="%d")
         _save("icb_calving_day.dat",    np.zeros(len(out["lon"].values)))
 
         print(f" * wrote {len(out)} iceberg records to {self.icb_path}")
@@ -720,20 +751,23 @@ class IcebergCalving:
     def _extract_valid_cells(self):
         """
         Single-pass filter → self.data / self.lons / self.lats (aligned).
-        self.lons and self.lats are geographic (from PISM lon_bnds/lat_bnds).
+        self.lons and self.lats are the geographic cell centres (PISM lon/lat).
+
+        Centres are taken from lon/lat, not by averaging the four lon_bnds
+        corners: that average is wrong for cells spanning the ±180 meridian
+        (mean of [-179.9, 179.9] is 0) and for files with inconsistent bounds
+        (e.g. mirrored lon_bnds put bergs on the wrong side of Antarctica).
         """
         disch_flat = self.disch_field.values.ravel()
 
-        lb = self.fl.lon_bnds.values
-        la = self.fl.lat_bnds.values
-        lon_center = lb.reshape(-1, 4).mean(axis=1)
-        lat_center = la.reshape(-1, 4).mean(axis=1)
+        lon_center = np.asarray(self.fl.lon.values, dtype=float).ravel()
+        lat_center = np.asarray(self.fl.lat.values, dtype=float).ravel()
         lon_center = np.where(lon_center > 180, lon_center - 360, lon_center)
 
         if len(disch_flat) != len(lon_center):
             raise ValueError(
                 f"disch_field has {len(disch_flat)} cells but "
-                f"lon_bnds implies {len(lon_center)} — check PISM file dimensions"
+                f"lon has {len(lon_center)} — check PISM file dimensions"
             )
 
         mask = np.isfinite(disch_flat) & (disch_flat < self.min_disch_in_cell)
@@ -741,6 +775,62 @@ class IcebergCalving:
         self.lons = lon_center[mask]
         self.lats = lat_center[mask]
         print(f" * valid calving cells: {mask.sum()}")
+
+    # ── FESOM cavity freshwater flux as calving input (input_type="fesom") ──
+
+    def _read_fesom_fw_file(self):
+        """
+        Read FESOM freshwater flux (fw, m/s) and take the annual mean over any
+        number of time steps (daily, monthly, annual). Node areas come from
+        fesom.mesh.diag.nc.
+        """
+        print(f" * open FESOM freshwater flux file: {self.ifile}")
+        self.fl = xr.open_dataset(self.ifile, decode_times=False)
+        fw = self.fl["fw"]
+        n_time = fw.sizes.get("time", 1)
+        print(f" * number of timesteps in file: {n_time}")
+        self.fw_annual = fw.mean(dim="time") if "time" in fw.dims else fw
+
+        print(f" * reading mesh diagnostics from: {self.mesh_diag_file}")
+        self.mesh_diag = xr.open_dataset(self.mesh_diag_file)
+        # surface node area = max over the level dimension (called nz or nl
+        # depending on the FESOM version)
+        na = self.mesh_diag["nod_area"]
+        self.node_area = na.max(dim=na.dims[0]) if na.ndim == 2 else na
+
+    def _apply_cavity_mask(self):
+        """Keep only cavity nodes (all adjacent elements are cavity elements)."""
+        self.cavity_mask = build_cavity_mask(self.mesh_path, which="node")
+        print(
+            f" * found {int(self.cavity_mask.sum())} cavity nodes out of "
+            f"{self.cavity_mask.size} total nodes"
+        )
+        self.fw_cavity = self.fw_annual.values[self.cavity_mask]
+        self.node_area_cavity = self.node_area.values[self.cavity_mask]
+        self.cavity_node_indices = np.where(self.cavity_mask)[0]
+
+    def _convert_fesom_to_m3_year(self):
+        """fw [m/s] × node area [m²] × s/yr → m³/yr water per node."""
+        seconds_per_year = 365.25 * 86400
+        self.data = self.fw_cavity * self.node_area_cavity * seconds_per_year
+
+    def _get_fesom_coords(self):
+        """
+        Geographic lon/lat of the cavity nodes: from mesh diagnostics if it
+        has lon/lat (newer FESOM), otherwise from nod2d.out (mesh frame,
+        converted to geographic with abg; identity for abg=[0,0,0]).
+        """
+        idx = self.cavity_node_indices
+        if "lon" in self.mesh_diag and "lat" in self.mesh_diag:
+            lons = self.mesh_diag["lon"].values[idx]
+            lats = self.mesh_diag["lat"].values[idx]
+        else:
+            nod = np.loadtxt(self.nod2d_file, skiprows=1)
+            self._build_rotation_matrix()
+            lons, lats = self._rot_to_geo(nod[idx, 1], nod[idx, 2])
+        self.lons = np.where(lons > 180, lons - 360, lons)
+        self.lats = np.asarray(lats)
+        print(f" * extracted coordinates for {len(self.lons)} cavity locations")
 
     def _assign_basins(self):
         """O(N log M) basin assignment via KDTree."""
@@ -794,6 +884,7 @@ class IcebergCalving:
 
         median = 2 ** (1.0 / (a - 1.0)) * xmin
         disch_tot = abs(float(df.disch)) / 1e9   # km³/year
+        print(f" * total ice discharge within basin: {disch_tot:.2f} km3 year-1")
         area_tot = disch_tot / self.thick_max
         N = int(area_tot / median)
         if N == 0:
@@ -948,3 +1039,35 @@ def PointInTriangle(pt, v1, v2, v3):
     has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
     has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
     return not (has_neg and has_pos)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Cavity mask (used for input_type="fesom")
+# ══════════════════════════════════════════════════════════════════════
+
+def build_cavity_mask(meshpath, which="element"):
+    """
+    Cavity mask for elements or nodes from cavity_elvls.out.
+
+    which="element": element is a cavity element if its cavity level > 1.
+    which="node":    node is a cavity node if all elements containing it are
+                     cavity elements.
+    """
+    elem_cav = (
+        np.loadtxt(os.path.join(meshpath, "cavity_elvls.out"), dtype=int) > 1
+    )
+    if which == "element":
+        return elem_cav
+    if which != "node":
+        raise ValueError("which must be 'element' or 'node'")
+
+    elems = np.loadtxt(os.path.join(meshpath, "elem2d.out"), skiprows=1, dtype=int) - 1
+    with open(os.path.join(meshpath, "nod2d.out")) as f:
+        n_nodes = int(f.readline())
+    # a node is non-cavity if any of its elements is non-cavity
+    has_open = np.zeros(n_nodes, dtype=bool)
+    for k in range(3):
+        np.logical_or.at(has_open, elems[~elem_cav, k], True)
+    in_any = np.zeros(n_nodes, dtype=bool)
+    in_any[elems.ravel()] = True
+    return in_any & ~has_open
