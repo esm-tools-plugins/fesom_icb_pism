@@ -37,6 +37,21 @@ def prep_icebergs(config):
         return config
 
 
+def _per_file(value, n, name):
+    """
+    One value per disch_file: a single value is used for all files, a list
+    must be as long as disch_file (same order).
+    """
+    if not isinstance(value, list):
+        return [value] * n
+    if len(value) != n:
+        raise ValueError(
+            f"fesom_icb_pism: {name} must be a single value or a list as long "
+            f"as disch_file ({n})"
+        )
+    return value
+
+
 def _seed(config):
     date = config["general"]["current_date"]
     return int(str(date.year) + str(date.month))
@@ -97,16 +112,18 @@ def update_icebergs(config):
             # next year (berg sizes then follow the power law); default: on
             # with icb_size_from_ice, off otherwise
             carry_over=config["fesom"].get("icb_carry_over"),
-            # largest berg of a basin = at most this many years of its
-            # discharge (use with a large ibareamax, e.g. 10000 km2, and
-            # carry-over); default off
-            max_berg_years=config["fesom"].get("icb_max_berg_years"),
             carry_file=os.path.join(
                 config["general"]["experiment_couple_dir"], "icb_carry_over.json"
             ),
             year=config["general"]["current_date"].year,
         )
+        # per disch_file: a single value for all files, or a list in the order
+        # of disch_file (e.g. ibareamax: [10000, 400] for [sh, greenland]).
+        # icb_max_berg_years: largest berg of a basin = at most this many years
+        # of its discharge (use with a large ibareamax and carry-over).
         geometry_file = config["fesom"].get("icb_geometry_file")
+        ibareamax = config["fesom"].get("ibareamax", 400)
+        max_berg_years = config["fesom"].get("icb_max_berg_years")
 
         if config["fesom"].get("rotate", False):
             abg = [50, 15, -90]
@@ -123,25 +140,15 @@ def update_icebergs(config):
                 raise ValueError(
                     "fesom_icb_pism: disch_file and basin_file need to be of same length"
                 )
-            domain = config["fesom"].get("domain", "sh")
-            if isinstance(domain, str):
-                # a single string would otherwise be zipped letter by letter
-                domain = [domain] * len(disch_file)
-            if len(domain) != len(disch_file):
-                raise ValueError(
-                    "fesom_icb_pism: domain must be a string or a list as long as "
-                    "disch_file"
-                )
-            if not isinstance(geometry_file, list):
-                geometry_file = [geometry_file] * len(disch_file)
-            if len(geometry_file) != len(disch_file):
-                raise ValueError(
-                    "fesom_icb_pism: icb_geometry_file must be a single path or "
-                    "a list as long as disch_file"
-                )
+            n = len(disch_file)
+            domain = _per_file(config["fesom"].get("domain", "sh"), n, "domain")
+            geometry_file = _per_file(geometry_file, n, "icb_geometry_file")
+            ibareamax = _per_file(ibareamax, n, "ibareamax")
+            max_berg_years = _per_file(max_berg_years, n, "icb_max_berg_years")
             fmode = "w"
-            for dfile, bfile, dom, gfile in zip(
-                disch_file, basin_file, domain, geometry_file
+            for dfile, bfile, dom, gfile, amax, kyears in zip(
+                disch_file, basin_file, domain, geometry_file, ibareamax,
+                max_berg_years,
             ):
                 ib = IcebergCalving(
                     dfile,
@@ -151,7 +158,8 @@ def update_icebergs(config):
                     icb_restart_file,
                     scaling_factor=scaling_factor,
                     seed=_seed(config),
-                    ibareamax=config["fesom"].get("ibareamax", 400),
+                    ibareamax=amax,
+                    max_berg_years=kyears,
                     domain=dom,
                     bcavities=bcavities,
                     abg=abg,
@@ -172,7 +180,10 @@ def update_icebergs(config):
                 icb_restart_file,
                 scaling_factor=scaling_factor,
                 seed=_seed(config),
-                ibareamax=config["fesom"].get("ibareamax", 400),
+                ibareamax=_per_file(ibareamax, 1, "ibareamax")[0],
+                max_berg_years=_per_file(
+                    max_berg_years, 1, "icb_max_berg_years"
+                )[0],
                 domain=config["fesom"].get("domain", "sh"),
                 bcavities=bcavities,
                 abg=abg,
