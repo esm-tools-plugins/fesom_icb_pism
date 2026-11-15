@@ -64,10 +64,14 @@ ice sheet sets the geometry:
   PISM mask, still works on time-averaged fields.  Each basin is split into a
   grounded and a floating population with their own H, size limit and seeding
   elements.
-* Size limit: grounded fronts calve bergs with a length of at most
-  length_thickness_ratio * H, i.e. area_max = min(ibareamax,
-  (length_thickness_ratio * H)**2).  Floating fronts keep ibareamax (tabular
-  bergs are set by the shelf/rift geometry, which PISM does not resolve).
+* Berg areas: as in the prescribed mode, from the observed power law
+  (alpha per domain/basin) up to ibareamax, so the size distribution still
+  follows the observations (which include bergs from grounded fronts).
+  Optional size limit (length_thickness_ratio, default None = off): grounded
+  fronts calve bergs with a length of at most length_thickness_ratio * H,
+  i.e. area_max = min(ibareamax, (length_thickness_ratio * H)**2).  This
+  departs from the observed distribution (e.g. Antarctica: volume share of
+  bergs < 1 km² 11 % instead of 5 %), so use it only on purpose.
 * Stability: berg thickness is the largest height that is stable for its
   length under FESOM's Weeks & Mellor roll-over criterion
   (icb_thermo.F90: rolls if L < sqrt(0.92 H**2 + 58.32 H), in m), capped
@@ -86,6 +90,23 @@ ice sheet sets the geometry:
 
 The power-law exponent is unchanged.  thk and topg are read from geometry_file (default: the
 discharge file; must be on the same grid).
+
+Largest berg per basin (max_berg_years, default None = off)
+-----------------------------------------------------------
+The observed Antarctic size distribution (Tournadre et al. 2016,
+doi:10.1002/2015JC011178) follows the -1.52 power law up to ~10,000 km²,
+and bergs > 100 km² carry ~89 % of the volume; with ibareamax = 400 km² this
+is only ~49 %.  Raising ibareamax alone lets small basins calve giant bergs
+they cannot produce (one 10,000 km² berg is ~0.9 yr of all Antarctic
+discharge).  With max_berg_years = K the largest berg of a basin (and front
+type) holds at most K years of that basin's own discharge:
+    area_max = min(ibareamax, K * discharge / H)
+so giant bergs come from the basins with large discharge (the big ice
+shelves), and with carry-over a basin never runs more than K years ahead of
+its discharge.  Antarctica, ibareamax = 10,000 km², K = 10: volume shares
+0.1-10 / 10-100 / >100 km² = 3.8 / 8.6 / 87 % (paper: 3-4 / 7-8 / 89 %).
+Use it together with carry_over (without carry-over a basin cannot calve a
+berg larger than one year of its discharge anyway).
 
 Carry-over (carry_over=True; default with size_from_ice, optional otherwise)
 ---------------------------------------------------------------------------
@@ -138,10 +159,11 @@ class IcebergCalving:
         mesh_diag_file=None,
         size_from_ice=False,
         geometry_file=None,
-        length_thickness_ratio=4.0,
+        length_thickness_ratio=None,
         draft="deep",
         deep_max_rings=10,
         carry_over=None,
+        max_berg_years=None,
         carry_file=None,
         year=None,
     ):
@@ -196,7 +218,10 @@ class IcebergCalving:
         # berg geometry from the ice sheet (see module docstring)
         self.size_from_ice = bool(size_from_ice)
         self.geometry_file = geometry_file or ifile
-        self.length_thickness_ratio = float(length_thickness_ratio)
+        self.length_thickness_ratio = (
+            None if length_thickness_ratio is None
+            else float(length_thickness_ratio)
+        )
         if draft not in ("deep", "thin", "none"):
             raise ValueError(
                 f"draft must be 'deep', 'thin' or 'none', not {draft!r}"
@@ -205,6 +230,12 @@ class IcebergCalving:
         self.deep_max_rings = int(deep_max_rings)
         # carry-over between years (see module docstring); default: on with
         # size_from_ice, off for the prescribed distribution
+        self.max_berg_years = (
+            None if max_berg_years is None else float(max_berg_years)
+        )
+        if self.max_berg_years is not None:
+            print(f" * largest berg per basin: at most {self.max_berg_years:g} "
+                  f"years of its discharge (ibareamax = {ibareamax} km2)")
         self.carry_over = (
             self.size_from_ice if carry_over is None else bool(carry_over)
         )
@@ -231,7 +262,7 @@ class IcebergCalving:
                 )
             print(f" * geometry file = {self.geometry_file}")
             print(f" * length/thickness ratio (grounded fronts) = "
-                  f"{self.length_thickness_ratio}")
+                  f"{self.length_thickness_ratio or 'off'}")
             print(f" * draft = {self.draft}"
                   + (f" (up to {self.deep_max_rings} rings)"
                      if self.draft == "deep" else ""))
@@ -358,7 +389,12 @@ class IcebergCalving:
             d = grp["disch"].abs().values
             disch = float(grp["disch"].astype("float64").sum())
             if not self.size_from_ice:
-                rows.append((bid, ft, disch, self.thick_max, self.area_max))
+                amax = self._limit_by_discharge(self.area_max, disch,
+                                                self.thick_max)
+                rows.append((bid, ft, disch, self.thick_max, amax))
+                if self.max_berg_years is not None:
+                    print(f" * basin {bid}: {-disch * 1e-9:.3f} km3/yr, "
+                          f"area_max = {amax:.1f} km2")
                 continue
             H = grp["H"].values
             ok = np.isfinite(H) & (H > 0)
@@ -369,12 +405,12 @@ class IcebergCalving:
                 h_km = float(H[ok].mean()) / 1e3
             else:
                 h_km = self.thick_max
-            if ft == 1:   # floating front: tabular bergs, keep ibareamax
-                amax = self.area_max
-            else:         # grounded (tidewater) front: L <= ratio * H
+            if ft == 1 or self.length_thickness_ratio is None:
+                amax = self.area_max   # observed power law up to ibareamax
+            else:         # optional: grounded (tidewater) front, L <= ratio * H
                 amax = min(self.area_max,
                            (self.length_thickness_ratio * h_km) ** 2)
-            amax = max(amax, 10 * self.area_min)
+            amax = self._limit_by_discharge(amax, disch, h_km)
             rows.append((bid, ft, disch, h_km, amax))
             print(
                 f" * basin {bid} {'floating' if ft else 'grounded'} front: "
@@ -389,6 +425,16 @@ class IcebergCalving:
         return pd.DataFrame(
             rows, columns=["basin", "ftype", "disch", "thick", "amax"]
         ).set_index(["basin", "ftype"])
+
+    def _limit_by_discharge(self, amax, disch, h_km):
+        """
+        With max_berg_years = K: no berg holds more than K years of the
+        group's discharge, area_max = min(amax, K * discharge / H) [km²].
+        Never below 10 * area_min.
+        """
+        if self.max_berg_years is not None and h_km > 0:
+            amax = min(amax, self.max_berg_years * abs(disch) / 1e9 / h_km)
+        return max(amax, 10 * self.area_min)
 
     def generate_icebergs(self, fmode="w"):
         """
@@ -1404,8 +1450,8 @@ class IcebergCalving:
                 # bin beyond the scaling list (area > bins[-1] km²): keep the
                 # bergs individually instead of dropping them
                 print(
-                    f"  * WARNING: {len(ib_bin)} bergs in size bin {i} without "
-                    f"scaling factor; using scaling 1"
+                    f"  * {len(ib_bin)} bergs larger than {self.bins[-1]} km2 "
+                    f"(beyond the scaling_factor list): kept individually"
                 )
                 s = 1
             chunks = np.array_split(ib_bin, math.ceil(len(ib_bin) / s))

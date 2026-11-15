@@ -84,8 +84,10 @@ def update_icebergs(config):
         # read from icb_geometry_file (default: the discharge file).
         size_kw = dict(
             size_from_ice=config["fesom"].get("icb_size_from_ice", False),
+            # optional size limit for grounded fronts (berg length <= ratio *
+            # front thickness); default off: areas follow the observed power law
             length_thickness_ratio=config["fesom"].get(
-                "icb_length_thickness_ratio", 4.0
+                "icb_length_thickness_ratio"
             ),
             # "deep": seed in the nearest element deep enough for the draft,
             # "thin": make the berg thinner instead, "none": no check
@@ -95,6 +97,10 @@ def update_icebergs(config):
             # next year (berg sizes then follow the power law); default: on
             # with icb_size_from_ice, off otherwise
             carry_over=config["fesom"].get("icb_carry_over"),
+            # largest berg of a basin = at most this many years of its
+            # discharge (use with a large ibareamax, e.g. 10000 km2, and
+            # carry-over); default off
+            max_berg_years=config["fesom"].get("icb_max_berg_years"),
             carry_file=os.path.join(
                 config["general"]["experiment_couple_dir"], "icb_carry_over.json"
             ),
