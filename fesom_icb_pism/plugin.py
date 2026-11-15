@@ -79,6 +79,29 @@ def update_icebergs(config):
         mesh_diag_file = config["fesom"].get("mesh_diag_file")
         print(f" * icb_input_type = {input_type}")
 
+        # berg thickness / size limit from the ice sheet geometry instead of
+        # the prescribed 250 m / ibareamax (PISM input only). thk and topg are
+        # read from icb_geometry_file (default: the discharge file).
+        size_kw = dict(
+            size_from_ice=config["fesom"].get("icb_size_from_ice", False),
+            length_thickness_ratio=config["fesom"].get(
+                "icb_length_thickness_ratio", 4.0
+            ),
+            # "deep": seed in the nearest element deep enough for the draft,
+            # "thin": make the berg thinner instead, "none": no check
+            draft=config["fesom"].get("icb_draft", "deep"),
+            deep_max_rings=config["fesom"].get("icb_deep_max_rings", 10),
+            # carry the difference between seeded volume and discharge to the
+            # next year (berg sizes then follow the power law); default: on
+            # with icb_size_from_ice, off otherwise
+            carry_over=config["fesom"].get("icb_carry_over"),
+            carry_file=os.path.join(
+                config["general"]["experiment_couple_dir"], "icb_carry_over.json"
+            ),
+            year=config["general"]["current_date"].year,
+        )
+        geometry_file = config["fesom"].get("icb_geometry_file")
+
         if config["fesom"].get("rotate", False):
             abg = [50, 15, -90]
         else:
@@ -103,8 +126,17 @@ def update_icebergs(config):
                     "fesom_icb_pism: domain must be a string or a list as long as "
                     "disch_file"
                 )
+            if not isinstance(geometry_file, list):
+                geometry_file = [geometry_file] * len(disch_file)
+            if len(geometry_file) != len(disch_file):
+                raise ValueError(
+                    "fesom_icb_pism: icb_geometry_file must be a single path or "
+                    "a list as long as disch_file"
+                )
             fmode = "w"
-            for dfile, bfile, dom in zip(disch_file, basin_file, domain):
+            for dfile, bfile, dom, gfile in zip(
+                disch_file, basin_file, domain, geometry_file
+            ):
                 ib = IcebergCalving(
                     dfile,
                     mesh_dir,
@@ -119,6 +151,8 @@ def update_icebergs(config):
                     abg=abg,
                     input_type=input_type,
                     mesh_diag_file=mesh_diag_file,
+                    geometry_file=gfile,
+                    **size_kw,
                 )
                 ib.create_distribution()
                 ib.generate_icebergs(fmode=fmode)
@@ -138,6 +172,8 @@ def update_icebergs(config):
                 abg=abg,
                 input_type=input_type,
                 mesh_diag_file=mesh_diag_file,
+                geometry_file=geometry_file,
+                **size_kw,
             )
             ib.create_distribution()
             ib.generate_icebergs(fmode="w")

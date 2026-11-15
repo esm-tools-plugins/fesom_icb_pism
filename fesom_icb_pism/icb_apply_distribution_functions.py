@@ -48,15 +48,71 @@ Changes 2026-11
 * Position RNG uses the seed argument (was fixed to 0 every year).
 * Bergs in size bins beyond len(scaling_factor) are kept with scaling 1
   (were silently dropped).
+
+Berg size from the ice sheet (size_from_ice=True, PISM input only)
+-------------------------------------------------------------------
+By default the size distribution is fully prescribed (berg thickness
+min(sqrt(area), 250 m), areas up to ibareamax).  With size_from_ice=True the
+ice sheet sets the geometry:
+
+* Front thickness H: for every discharge cell the largest PISM thickness (thk)
+  in its 3x3 neighbourhood (the cell itself is mostly ice free in the yearly
+  mean because the front retreated through it).  Per basin and front type the discharge-weighted
+  mean H is the maximum berg thickness (replaces the fixed 250 m).
+* Front type: floating (ice shelf / floating tongue) or grounded (tidewater),
+  from the flotation criterion thk * rho_i/rho_sw < -topg, which, unlike the
+  PISM mask, still works on time-averaged fields.  Each basin is split into a
+  grounded and a floating population with their own H, size limit and seeding
+  elements.
+* Size limit: grounded fronts calve bergs with a length of at most
+  length_thickness_ratio * H, i.e. area_max = min(ibareamax,
+  (length_thickness_ratio * H)**2).  Floating fronts keep ibareamax (tabular
+  bergs are set by the shelf/rift geometry, which PISM does not resolve).
+* Stability: berg thickness is the largest height that is stable for its
+  length under FESOM's Weeks & Mellor roll-over criterion
+  (icb_thermo.F90: rolls if L < sqrt(0.92 H**2 + 58.32 H), in m), capped
+  at H.  This replaces the sqrt(area) rule, so FESOM does not roll the bergs
+  over in their first step.
+* Draft (water depth at the seeding element = shallowest of its three node
+  depths, aux3d.out; draft = thickness * rho_ice / rho_sw):
+    draft="deep" (default): a berg whose draft exceeds the water depth of the
+      calving elements is seeded in the nearest element that is deep enough
+      (successive rings of neighbours, up to deep_max_rings; within a ring the
+      usual fits / not-full tiers apply).  If there is none, it falls back to
+      "thin" in the element chosen as usual.
+    draft="thin": the berg stays at the calving elements and is made thinner
+      (and wider at constant volume) to float there.
+    draft="none": no check; FESOM grounds bergs that are too deep.
+
+The power-law exponent is unchanged.  thk and topg are read from geometry_file (default: the
+discharge file; must be on the same grid).
+
+Carry-over (carry_over=True; default with size_from_ice, optional otherwise)
+---------------------------------------------------------------------------
+Without carry-over every basin seeds exactly its discharge each year: the
+drawn bergs are rescaled to the discharge, which biases against the largest
+bergs, and a basin can never calve a berg bigger than one year of its
+discharge.  With carry-over, bergs are drawn one at a time until the target
+(this year's discharge + last year's carry) is reached; the berg that crosses
+the target is always kept and the difference is carried to the next year.
+Sizes then follow the power law, and mass is conserved over the years
+instead of every year (a basin may run ahead by a few years of discharge,
+like episodic calving of large tabular bergs).
+
+The carry per basin and front type [km³ ice] is kept in a small JSON file
+(default <couple dir>/icb_carry_over.json), one entry per model year:
+    {"3382": {"sh|antarctica.16km.nc|1|0": -12.3, ...}, "3383": {...}}
+The entry for year Y is the carry going into year Y, so rerunning a year
+reads the same values again.  Delete the file to start from zero.
 """
 
+import json
 import math
 import os
 import time
 
 import numpy as np
 import pandas as pd
-import powerlaw
 import pyfesom2 as pf
 import xarray as xr
 from scipy.spatial import KDTree
@@ -80,6 +136,14 @@ class IcebergCalving:
         domain="SH",
         input_type="pism",
         mesh_diag_file=None,
+        size_from_ice=False,
+        geometry_file=None,
+        length_thickness_ratio=4.0,
+        draft="deep",
+        deep_max_rings=10,
+        carry_over=None,
+        carry_file=None,
+        year=None,
     ):
         if abg is None:
             abg = [50, 15, -90]
@@ -129,11 +193,56 @@ class IcebergCalving:
         self.domain = domain
         self.bcavities = bcavities
 
+        # berg geometry from the ice sheet (see module docstring)
+        self.size_from_ice = bool(size_from_ice)
+        self.geometry_file = geometry_file or ifile
+        self.length_thickness_ratio = float(length_thickness_ratio)
+        if draft not in ("deep", "thin", "none"):
+            raise ValueError(
+                f"draft must be 'deep', 'thin' or 'none', not {draft!r}"
+            )
+        self.draft = draft if self.size_from_ice else "none"
+        self.deep_max_rings = int(deep_max_rings)
+        # carry-over between years (see module docstring); default: on with
+        # size_from_ice, off for the prescribed distribution
+        self.carry_over = (
+            self.size_from_ice if carry_over is None else bool(carry_over)
+        )
+        self.carry_file = carry_file or os.path.join(icb_path,
+                                                     "icb_carry_over.json")
+        self.year = None if year is None else int(year)
+        if self.carry_over and self.year is None:
+            raise ValueError("carry_over=True needs the model year (year=...)")
+        self._carry_prefix = (f"{domain}|{os.path.basename(str(basin_file))}"
+                              if basin_file else str(domain))
+        self._carry_in, self._carry_out = {}, {}
+        if self.carry_over:
+            self._carry_in = self._read_carry()
+            print(f" * carry_over  = True ({self.carry_file}, year {self.year})")
+        self.rho_ice_pism = 910.0    # PISM defaults, for the flotation test
+        self.rho_sw_pism = 1028.0
+        self.rho_sw = 1027.0         # sea water, for the draft limit
+        self.thk_min = 10.0          # m, cells thinner than this are ice free
+        print(f" * size_from_ice = {self.size_from_ice}")
+        if self.size_from_ice:
+            if self.input_type != "pism":
+                raise ValueError(
+                    "size_from_ice=True needs input_type='pism' (PISM thk/topg)"
+                )
+            print(f" * geometry file = {self.geometry_file}")
+            print(f" * length/thickness ratio (grounded fronts) = "
+                  f"{self.length_thickness_ratio}")
+            print(f" * draft = {self.draft}"
+                  + (f" (up to {self.deep_max_rings} rings)"
+                     if self.draft == "deep" else ""))
+
         # ── read calving input ─────────────────────────────────────────
         if self.input_type == "pism":
             self._read_pism_file()
             self._get_pism_resolution()
             self._convert_to_kg_m2_year1()
+            if self.size_from_ice:
+                self._read_front_geometry()
         elif self.input_type == "fesom":
             self._read_fesom_fw_file()
             self._apply_cavity_mask()
@@ -149,6 +258,8 @@ class IcebergCalving:
         self._read_nod2d_file()    # rotated lon/lat from nod2d.out
         self._read_elem2d_file()
         self._build_rotation_matrix()   # g2r / r2g from abg Euler angles
+        if self.draft != "none":
+            self._build_elem_max_thickness()
 
         # ── node-level cavity depths ───────────────────────────────────
         self._cavity_node_depth = None
@@ -202,16 +313,25 @@ class IcebergCalving:
         self._assign_basins()
         self._assign_fesom_elems()
 
+        if self.size_from_ice:
+            front_H = self.front_H                       # m, NaN = unknown
+            ftype = self.front_floating.astype(int)      # 1 floating, 0 grounded
+        else:
+            front_H = np.full(len(disch), self.thick_max * 1e3)
+            ftype = np.zeros(len(disch), dtype=int)
+
         self.df = pd.DataFrame({
             "disch": disch,  # m³/year ice
             "elem":  self.elem_ids,
             "basin": self.basins1D,
+            "ftype": ftype,
         }).dropna()
+        self.df["H"] = front_H[self.df.index.values]
 
-        self.df_agg = self.df[["disch", "basin"]].groupby("basin").sum()
+        self.df_agg = self._aggregate_groups()
 
         elem_lists, neigh_lists = [], []
-        for _bid, grp in self.df.groupby("basin"):
+        for _bid, grp in self.df.groupby(["basin", "ftype"]):
             unique_elems = grp["elem"].unique().astype(int)
             elem_lists.append(unique_elems)
             neigh_lists.append([self.neighbours.get(int(e), []) for e in unique_elems])
@@ -221,8 +341,54 @@ class IcebergCalving:
 
         print(
             f" * {len(self.df)} discharge cells across "
-            f"{len(self.df_agg)} basins"
+            f"{self.df_agg.index.get_level_values(0).nunique()} basins"
         )
+
+    def _aggregate_groups(self):
+        """
+        Discharge per (basin, front type) plus the berg geometry of the group:
+        thick = maximum berg thickness [km], amax = maximum berg area [km²].
+        Without size_from_ice there is one group per basin (ftype 0) with the
+        prescribed thick_max / ibareamax.
+        """
+        df = self.df
+        rows = []
+        n_unknown = 0
+        for (bid, ft), grp in df.groupby(["basin", "ftype"]):
+            d = grp["disch"].abs().values
+            disch = float(grp["disch"].astype("float64").sum())
+            if not self.size_from_ice:
+                rows.append((bid, ft, disch, self.thick_max, self.area_max))
+                continue
+            H = grp["H"].values
+            ok = np.isfinite(H) & (H > 0)
+            n_unknown += int((~ok).sum())
+            if ok.any() and d[ok].sum() > 0:
+                h_km = float((d[ok] * H[ok]).sum() / d[ok].sum()) / 1e3
+            elif ok.any():
+                h_km = float(H[ok].mean()) / 1e3
+            else:
+                h_km = self.thick_max
+            if ft == 1:   # floating front: tabular bergs, keep ibareamax
+                amax = self.area_max
+            else:         # grounded (tidewater) front: L <= ratio * H
+                amax = min(self.area_max,
+                           (self.length_thickness_ratio * h_km) ** 2)
+            amax = max(amax, 10 * self.area_min)
+            rows.append((bid, ft, disch, h_km, amax))
+            print(
+                f" * basin {bid} {'floating' if ft else 'grounded'} front: "
+                f"{-disch * 1e-9:.3f} km3/yr, H = {h_km * 1e3:.0f} m, "
+                f"area_max = {amax:.2f} km2"
+            )
+        if n_unknown:
+            print(
+                f" * WARNING: {n_unknown} discharge cells without ice in their "
+                f"3x3 neighbourhood; they use the mean H of their group"
+            )
+        return pd.DataFrame(
+            rows, columns=["basin", "ftype", "disch", "thick", "amax"]
+        ).set_index(["basin", "ftype"])
 
     def generate_icebergs(self, fmode="w"):
         """
@@ -244,12 +410,19 @@ class IcebergCalving:
         with tqdm(
             total=len(self.df_agg), file=sys.stdout, desc="generate icebergs per basin"
         ) as pbar:
-            for basin_id in self.df_agg.index:
-                b = self.df_agg.loc[basin_id]
-                print(f"*** BASIN = {basin_id}")
+            n_thinned = n_moved = 0
+            self.moved_rings = []   # ring distance of every moved object
+            for key in self.df_agg.index:
+                basin_id, ftype = key
+                b = self.df_agg.loc[key]
+                print(f"*** BASIN = {basin_id}"
+                      + ((" (floating front)" if ftype else " (grounded front)")
+                         if self.size_from_ice else ""))
 
                 while True:
-                    ib_tmp = self._create_icebergs_within_basin(b, idx=basin_id)
+                    ib_tmp = self._create_icebergs_within_basin(
+                        b, idx=basin_id, key=key
+                    )
                     if not isinstance(ib_tmp, pd.DataFrame):
                         continue
                     break
@@ -272,23 +445,45 @@ class IcebergCalving:
                     e for e in candidates if e in self.valid_elem_idx_set
                 )
 
-                basin_df = self.df[self.df["basin"] == basin_id]
+                basin_df = self.df[
+                    (self.df["basin"] == basin_id) & (self.df["ftype"] == ftype)
+                ]
                 disch_by_elem = (
                     basin_df.groupby("elem")["disch"].sum().abs()
                 )
 
                 # place the largest objects first so they get the most room
-                ib_area = (
-                    (ib_df["length"].values * 1e3) ** 2
-                    * ib_df["scaling"].values
-                )   # m²
+                length = ib_df["length"].values.astype(float)   # km
+                depth = ib_df["depth"].values.astype(float)     # km
+                scal = ib_df["scaling"].values
+                ib_area = (length * 1e3) ** 2 * scal   # m²
                 chosen_global = np.empty(n_ib, dtype=int)
                 for k in np.argsort(-ib_area, kind="stable"):
-                    e = self._choose_elem(
-                        candidates, disch_by_elem, fill, ib_area[k], rng,
-                        basin_id,
-                    )
+                    e = None
+                    if self.draft == "deep":
+                        # nearest element deep enough for this berg's draft
+                        e, ring = self._choose_elem(
+                            candidates, disch_by_elem, fill, ib_area[k], rng,
+                            basin_id, max_rings=self.deep_max_rings,
+                            min_thick=depth[k],
+                        )
+                        if e is not None and ring > 0:
+                            n_moved += 1
+                            self.moved_rings.append(ring)
+                    if e is None:
+                        e, _ = self._choose_elem(
+                            candidates, disch_by_elem, fill, ib_area[k], rng,
+                            basin_id,
+                        )
                     chosen_global[k] = e
+                    if self.draft != "none" and depth[k] > self._elem_max_thick[e]:
+                        # thinner and wider at constant volume, so the berg
+                        # floats in the water depth of this element
+                        h_new = self._elem_max_thick[e]
+                        length[k] *= math.sqrt(depth[k] / h_new)
+                        depth[k] = h_new
+                        ib_area[k] = (length[k] * 1e3) ** 2 * scal[k]
+                        n_thinned += 1
                     fill[e] = fill.get(e, 0.0) + float(ib_area[k])
 
                 pos = np.array([self._elem_pos_map[e] for e in chosen_global])
@@ -301,17 +496,27 @@ class IcebergCalving:
                 # geographic and converts internally via g2r.
                 lons_ib, lats_ib = self._rot_to_geo(lons_rot, lats_rot)
 
-                for i, (_, row) in enumerate(ib_df.iterrows()):
+                for i in range(n_ib):
                     all_rows.append({
-                        "length":  row.length,
-                        "depth":   row.depth,
-                        "scaling": row.scaling,
+                        "length":  length[i],
+                        "depth":   depth[i],
+                        "scaling": scal[i],
                         "lon":     float(lons_ib[i]),
                         "lat":     float(lats_ib[i]),
                         "felem":   int(chosen_global[i]),
                     })
 
                 pbar.update(1)
+
+        if self.draft == "deep":
+            r = np.asarray(self.moved_rings)
+            print(f" * draft: {n_moved} iceberg objects moved to a deeper "
+                  f"element (rings: median {np.median(r) if r.size else 0:.0f}, "
+                  f"max {r.max() if r.size else 0}); {n_thinned} without a deep "
+                  f"enough element within {self.deep_max_rings} rings thinned")
+        elif self.draft == "thin":
+            print(f" * draft: {n_thinned} iceberg objects thinned to "
+                  f"the water depth of their element")
 
         # Always (re)write the files, also when no bergs were generated:
         # otherwise the previous year's icb_*.dat stay in place and are
@@ -339,11 +544,18 @@ class IcebergCalving:
         _save("icb_calving_day.dat",    np.zeros(len(out["lon"].values)))
 
         print(f" * wrote {len(out)} iceberg records to {self.icb_path}")
+        if self.carry_over:
+            self._write_carry()
 
     def _choose_elem(self, candidates, disch_by_elem, fill, area, rng,
-                     basin_id, max_rings=10):
+                     basin_id, max_rings=10, min_thick=None):
         """
         Pick one element for an iceberg object of total area `area` [m²].
+        Returns (element, ring); ring 0 = one of the candidates.
+
+        With min_thick [km] only elements in which a berg of that thickness
+        floats are allowed; if there is none within max_rings, (None, None)
+        is returned and nothing is warned (the caller falls back).
 
         Tiers, tried on the candidate set and then on successive rings of
         valid neighbours (up to max_rings):
@@ -362,13 +574,15 @@ class IcebergCalving:
         for ring in range(max_rings + 1):
             if cset:
                 c = np.asarray(cset, dtype=int)
+                if min_thick is not None:
+                    c = c[self._elem_max_thick[c] >= min_thick]
                 free = voltri[c] - np.array([fill.get(int(e), 0.0) for e in c])
                 for ok in (free >= area, free > 0):
                     if ok.any():
                         cc = c[ok]
                         w = disch_by_elem.reindex(cc, fill_value=0.0).values
                         w = np.ones(cc.size) if w.sum() <= 0 else w
-                        return int(rng.choice(cc, p=w / w.sum()))
+                        return int(rng.choice(cc, p=w / w.sum())), ring
             # next ring of valid neighbours
             nxt = []
             for e in frontier:
@@ -380,6 +594,8 @@ class IcebergCalving:
                 break
             frontier = nxt
             cset = nxt
+        if min_thick is not None:
+            return None, None
         allc = np.asarray(sorted(seen), dtype=int)
         e = int(allc[np.argmin(
             [fill.get(int(x), 0.0) / voltri[x] for x in allc]
@@ -389,7 +605,7 @@ class IcebergCalving:
             f"{max_rings} rings; placing {area/1e6:.1f} km² in least-filled "
             f"element {e + 1}"
         )
-        return e
+        return e, max_rings
 
     def write_icb_mask(self):
         """Write the discharge mask (cells with calving flux) to icb_mask.nc."""
@@ -429,6 +645,74 @@ class IcebergCalving:
             self.disch_field = (
                 self.disch_field * 1e12 / (self.res * self.res)
             )
+
+    def _read_front_geometry(self):
+        """
+        Front thickness [m] and front type for every PISM cell, from thk and
+        topg in self.geometry_file (same grid as the discharge).  A cell's
+        front thickness is the largest thk in its 3x3 neighbourhood, i.e. the
+        ice that flows into it and calves (most discharge cells are ice free
+        in the yearly mean because the front retreated through them, and a
+        mean would include thin ice from the glacier's lateral margins).  It
+        is floating if most of the ice-covered cells (thk > thk_min) in the
+        neighbourhood float (thk * rho_i/rho_sw < -topg).
+        """
+        print(f" * open geometry file: {self.geometry_file}")
+        g = xr.open_dataset(self.geometry_file, decode_times=False)
+        missing = [v for v in ("thk", "topg") if v not in g]
+        if missing:
+            raise ValueError(
+                f"size_from_ice: {missing} not in {self.geometry_file}; set "
+                "icb_geometry_file to a PISM file with thk and topg on the "
+                "discharge grid (e.g. outdata/pism/latest_ex_file_pism.nc)"
+            )
+        thk = g["thk"]
+        topg = g["topg"]
+        if "time" in thk.dims:
+            thk = thk.mean("time")
+        if "time" in topg.dims:
+            topg = topg.mean("time")
+        thk = np.asarray(thk.squeeze().values, dtype=float)
+        topg = np.asarray(topg.squeeze().values, dtype=float)
+        if thk.shape != self.disch_field.shape or topg.shape != thk.shape:
+            raise ValueError(
+                f"size_from_ice: thk {thk.shape} / topg {topg.shape} do not "
+                f"match the discharge grid {self.disch_field.shape}"
+            )
+        thk = np.nan_to_num(thk, nan=0.0)
+        topg = np.nan_to_num(topg, nan=0.0)
+        ice = thk > self.thk_min
+        floating = ice & (thk * self.rho_ice_pism / self.rho_sw_pism < -topg)
+
+        def box_sum(a):
+            p = np.pad(a.astype(float), 1)
+            ny, nx = a.shape
+            return sum(
+                p[1 + dy: 1 + dy + ny, 1 + dx: 1 + dx + nx]
+                for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+            )
+
+        p = np.pad(np.where(ice, thk, 0.0), 1)
+        ny, nx = thk.shape
+        thk_max = np.max(
+            [p[1 + dy: 1 + dy + ny, 1 + dx: 1 + dx + nx]
+             for dy in (-1, 0, 1) for dx in (-1, 0, 1)],
+            axis=0,
+        )
+        n_ice = box_sum(ice)
+        self._front_H2d = np.where(n_ice > 0, thk_max, np.nan)
+        self._front_float2d = (n_ice > 0) & (box_sum(floating) > 0.5 * n_ice)
+
+    def _build_elem_max_thickness(self):
+        """
+        Largest berg thickness [km] that floats in each element: the element
+        depth is the shallowest of its three node depths (mesh.topo from
+        aux3d.out), draft = thickness * rho_ice / rho_sw.
+        """
+        depth = np.abs(np.asarray(self.mesh.topo, dtype=float))   # m, per node
+        nodes = self.elem2d.values.astype(int) - 1
+        elem_depth = depth[nodes].min(axis=1)
+        self._elem_max_thick = elem_depth * self.rho_sw / self.rho_ice / 1e3
 
     def _read_nod2d_file(self):
         # nod2d.out: header line (node count), then: node_id  lon  lat  coastal
@@ -774,6 +1058,9 @@ class IcebergCalving:
         self.data = disch_flat[mask]
         self.lons = lon_center[mask]
         self.lats = lat_center[mask]
+        if self.size_from_ice:
+            self.front_H = self._front_H2d.ravel()[mask]
+            self.front_floating = self._front_float2d.ravel()[mask]
         print(f" * valid calving cells: {mask.sum()}")
 
     # ── FESOM cavity freshwater flux as calving input (input_type="fesom") ──
@@ -864,7 +1151,7 @@ class IcebergCalving:
     # Iceberg size generation  (unchanged from v2)
     # ══════════════════════════════════════════════════════════════════
 
-    def _create_icebergs_within_basin(self, df, idx):
+    def _create_icebergs_within_basin(self, df, idx, key=None):
         """
         Generate a DataFrame of individual iceberg areas/volumes for one basin.
         Returns -1 on timeout (caller should retry), empty DataFrame if no
@@ -879,31 +1166,39 @@ class IcebergCalving:
         else:
             a = 1.52
         xmin = self.area_min
+        # maximum berg thickness [km] and area [km²] of this group
+        H = float(df["thick"])
+        xmax = float(df["amax"])
+
+        def thk(x):
+            return self._berg_thickness(x, H)
 
         print(f" * domain={self.domain}, alpha={a:.2f}, basin={idx}")
 
         median = 2 ** (1.0 / (a - 1.0)) * xmin
         disch_tot = abs(float(df.disch)) / 1e9   # km³/year
         print(f" * total ice discharge within basin: {disch_tot:.2f} km3 year-1")
-        area_tot = disch_tot / self.thick_max
-        N = int(area_tot / median)
+
+        if self.carry_over:
+            return self._draw_with_carry(disch_tot, key, a, xmin, xmax, thk)
+
+        area_tot = disch_tot / H
+        N = self._n_bergs(a, xmin, xmax, area_tot, median)
         if N == 0:
             return pd.DataFrame()
 
-        vrs = powerlaw.Power_Law(
-            xmin=xmin, xmax=self.area_max, parameters=[a]
-        ).generate_random(N)
+        vrs = self._draw_areas(a, xmin, xmax, N)
         x = vrs * (area_tot / vrs.sum())
 
-        thick = np.minimum(np.sqrt(x), self.thick_max)
+        thick = thk(x)
         vol = x * thick
         vol_sum_0 = float(vol.sum())
 
-        x = x[(x >= xmin) & (x <= self.area_max)]
+        x = x[(x >= xmin) & (x <= xmax)]
         if x.sum() == 0:
             return pd.DataFrame()
 
-        thick = np.minimum(np.sqrt(x), self.thick_max)
+        thick = thk(x)
         vol_sum_1 = float((x * thick).sum())
         if vol_sum_1 > 0:
             x = x * (vol_sum_0 / vol_sum_1)
@@ -912,7 +1207,7 @@ class IcebergCalving:
         tstart = time.time()
 
         while True:
-            thick = np.minimum(np.sqrt(x_tot), self.thick_max)
+            thick = thk(x_tot)
             vol_sum_1 = float((x_tot * thick).sum())
             if vol_sum_0 > 0:
                 N = int((vol_sum_0 - vol_sum_1) / vol_sum_0 * len(x_tot))
@@ -926,23 +1221,21 @@ class IcebergCalving:
                     f"for basin {idx}, retrying"
                 )
                 return -1
-            vrs = powerlaw.Power_Law(
-                xmin=xmin, xmax=self.area_max, parameters=[a]
-            ).generate_random(N)
-            new = vrs[(vrs >= xmin) & (vrs <= self.area_max)]
+            vrs = self._draw_areas(a, xmin, xmax, N)
+            new = vrs[(vrs >= xmin) & (vrs <= xmax)]
             x_tot = np.concatenate([x_tot, new])
             if x_tot.sum() == 0:
                 return pd.DataFrame()
-            thick = np.minimum(np.sqrt(x_tot), self.thick_max)
+            thick = thk(x_tot)
             vol_sum_1 = float((x_tot * thick).sum())
             if vol_sum_1 > 0:
                 x_tot = x_tot * (disch_tot / vol_sum_1)
 
         # Exact volume closure: total iceberg volume must equal the PISM discharge
         # (disch_tot). The loop above targets vol_sum_0, which is smaller than
-        # disch_tot because small bergs are thinner than thick_max
-        # (thick = sqrt(area)), so without this step 20-30 % of the discharge
-        # was lost. Volume is nonlinear in area (area**1.5 below thick_max**2),
+        # disch_tot because small bergs are thinner than the maximum thickness
+        # (see _berg_thickness), so without this step 20-30 % of the discharge
+        # was lost. Volume is nonlinear in area for the thinner bergs,
         # so solve for the area factor f by bisection; repeat if rescaling pushes
         # bergs below area_min (they are dropped in the return below).
         x_tot = x_tot[x_tot >= xmin]
@@ -952,7 +1245,7 @@ class IcebergCalving:
 
             def _vol(f):
                 xf = f * x_tot
-                return float((xf * np.minimum(np.sqrt(xf), self.thick_max)).sum())
+                return float((xf * thk(xf)).sum())
 
             lo, hi = 1e-3, 1e3
             for _ in range(100):
@@ -966,12 +1259,134 @@ class IcebergCalving:
                 break
             x_tot = x_tot[x_tot >= xmin]
 
-        thick = np.minimum(np.sqrt(x_tot), self.thick_max)
+        thick = thk(x_tot)
         return pd.DataFrame({
             "area":   x_tot,
             "volume": x_tot * thick,
             "bin":    np.digitize(x_tot, self.bins, right=True),
         }).query("area >= @self.area_min").reset_index(drop=True)
+
+    # ── carry-over between years ──────────────────────────────────────
+
+    def _carry_key(self, key):
+        basin, ftype = key
+        return f"{self._carry_prefix}|{int(basin)}|{int(ftype)}"
+
+    def _draw_with_carry(self, disch_tot, key, a, xmin, xmax, thk):
+        """
+        Draw bergs one at a time until this year's target (discharge + carry
+        from last year, km³) is reached.  The berg that crosses the target is
+        kept; the remainder (<= 0, i.e. taken from next year) is carried.
+        """
+        k = self._carry_key(key)
+        carry_in = float(self._carry_in.get(k, 0.0))
+        target = disch_tot + carry_in
+        areas, total = [], 0.0
+        while total < target:
+            x = self._draw_areas(a, xmin, xmax, 256)
+            cum = total + np.cumsum(x * thk(x))
+            n = int(np.searchsorted(cum, target))   # first berg reaching target
+            if n < x.size:
+                areas.append(x[: n + 1])
+                total = float(cum[n])
+                break
+            areas.append(x)
+            total = float(cum[-1])
+        self._carry_out[k] = target - total
+        print(f" * carry-over: in {carry_in:+.2f}, seeded {total:.2f}, "
+              f"out {target - total:+.2f} km3")
+        if not areas:
+            return pd.DataFrame()
+        x = np.concatenate(areas)
+        return pd.DataFrame({
+            "area":   x,
+            "volume": x * thk(x),
+            "bin":    np.digitize(x, self.bins, right=True),
+        })
+
+    def _read_carry(self):
+        """Carry into self.year from the JSON file ({} if none)."""
+        if not os.path.isfile(self.carry_file):
+            print(f" * no carry-over file yet ({self.carry_file}), starting at 0")
+            return {}
+        with open(self.carry_file) as f:
+            data = json.load(f)
+        carry = data.get(str(self.year))
+        if carry is None:
+            print(f" * WARNING: no carry-over for year {self.year} in "
+                  f"{self.carry_file}, starting at 0")
+            return {}
+        return carry
+
+    def _write_carry(self):
+        """Store the carry into self.year + 1; keep the last 100 years."""
+        # groups of this file without discharge this year keep their carry
+        for k, v in self._carry_in.items():
+            if k.startswith(self._carry_prefix + "|"):
+                self._carry_out.setdefault(k, v)
+        data = {}
+        if os.path.isfile(self.carry_file):
+            with open(self.carry_file) as f:
+                data = json.load(f)
+        nxt = data.setdefault(str(self.year + 1), {})
+        nxt.update({k: round(v, 6) for k, v in self._carry_out.items()})
+        for y in sorted(data, key=int)[:-100]:
+            del data[y]
+        tmp = self.carry_file + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=1, sort_keys=True)
+        os.replace(tmp, self.carry_file)
+
+    def _n_bergs(self, a, xmin, xmax, area_tot, median):
+        """
+        Number of bergs to draw for a total area area_tot [km²]: area_tot
+        divided by the mean of the truncated power law, so that rescaling the
+        sample to the discharge changes the drawn areas by a factor ~1 and
+        the distribution is kept; at least one berg if there is discharge.
+
+        (Until 2026-11 this was area_tot / median.  The mean of a power law
+        is much larger than its median (a = 1.52 on 0.01-400 km²: median
+        0.04 km², mean 1.7 km²), so ~45x too many bergs were drawn and the
+        rescaling shrank every berg by that factor: most fell below xmin and
+        were dropped, and the size distribution was not the intended one.)
+        """
+        if area_tot <= 0:
+            return 0
+        if abs(a - 2.0) < 1e-9:
+            mean = math.log(xmax / xmin) / (1.0 / xmin - 1.0 / xmax)
+        else:
+            mean = ((1.0 - a) / (2.0 - a)
+                    * (xmax ** (2.0 - a) - xmin ** (2.0 - a))
+                    / (xmax ** (1.0 - a) - xmin ** (1.0 - a)))
+        return max(1, int(round(area_tot / mean)))
+
+    def _draw_areas(self, a, xmin, xmax, N):
+        """
+        N berg areas [km²] from a power law with exponent a on [xmin, xmax],
+        sampled exactly (inverse CDF of the truncated power law).
+
+        (Until 2026-11 powerlaw.Power_Law(...).generate_random was used, which
+        ignores xmax: at a = 1.52 most of a sample's sum came from values far
+        above xmax, so after rescaling to the discharge nearly all bergs fell
+        below xmin and were dropped -- for a small group all of them, i.e.
+        the discharge was lost.)
+        """
+        u = np.random.random(N)
+        e = 1.0 - a
+        return (xmin ** e + u * (xmax ** e - xmin ** e)) ** (1.0 / e)
+
+    def _berg_thickness(self, area, H):
+        """
+        Berg thickness [km] for area [km²] with maximum thickness H [km].
+        Prescribed mode: min(sqrt(area), H).  size_from_ice: the largest
+        height that FESOM's Weeks & Mellor criterion keeps upright for
+        length sqrt(area) (L**2 = 0.92 h**2 + 58.32 h, in m), capped at H.
+        """
+        if not self.size_from_ice:
+            return np.minimum(np.sqrt(area), H)
+        L = np.sqrt(area) * 1e3   # m
+        h = (-58.32 + np.sqrt(58.32 ** 2 + 4 * 0.92 * L ** 2)) / (2 * 0.92)
+        return np.minimum(h / 1e3, H)
 
     def _scale_icebergs(self, df):
         """
@@ -999,8 +1414,17 @@ class IcebergCalving:
                 mv = float(chunk["volume"].mean())
                 if ma <= 0:
                     continue
-                length_out.append(float(np.sqrt(ma)))
-                depth_out.append(mv / ma)
+                L, h = float(np.sqrt(ma)), mv / ma
+                if self.size_from_ice:
+                    # averaging can make an object roll over although each
+                    # berg is stable: cap at the stable height for its
+                    # length and widen at constant volume (afterwards the
+                    # stable height only grows, so one step is enough)
+                    hs = float(self._berg_thickness(L * L, np.inf))
+                    if h > hs:
+                        L, h = math.sqrt(mv / hs), hs
+                length_out.append(L)
+                depth_out.append(h)
                 scaling_out.append(len(chunk))
 
         if not length_out:
