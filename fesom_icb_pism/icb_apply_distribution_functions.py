@@ -56,7 +56,6 @@ import time
 
 import numpy as np
 import pandas as pd
-import powerlaw
 import pyfesom2 as pf
 import xarray as xr
 from scipy.spatial import KDTree
@@ -882,17 +881,14 @@ class IcebergCalving:
 
         print(f" * domain={self.domain}, alpha={a:.2f}, basin={idx}")
 
-        median = 2 ** (1.0 / (a - 1.0)) * xmin
         disch_tot = abs(float(df.disch)) / 1e9   # km³/year
         print(f" * total ice discharge within basin: {disch_tot:.2f} km3 year-1")
         area_tot = disch_tot / self.thick_max
-        N = int(area_tot / median)
+        N = self._n_bergs(a, xmin, self.area_max, area_tot)
         if N == 0:
             return pd.DataFrame()
 
-        vrs = powerlaw.Power_Law(
-            xmin=xmin, xmax=self.area_max, parameters=[a]
-        ).generate_random(N)
+        vrs = self._draw_areas(a, xmin, self.area_max, N)
         x = vrs * (area_tot / vrs.sum())
 
         thick = np.minimum(np.sqrt(x), self.thick_max)
@@ -926,9 +922,7 @@ class IcebergCalving:
                     f"for basin {idx}, retrying"
                 )
                 return -1
-            vrs = powerlaw.Power_Law(
-                xmin=xmin, xmax=self.area_max, parameters=[a]
-            ).generate_random(N)
+            vrs = self._draw_areas(a, xmin, self.area_max, N)
             new = vrs[(vrs >= xmin) & (vrs <= self.area_max)]
             x_tot = np.concatenate([x_tot, new])
             if x_tot.sum() == 0:
@@ -972,6 +966,46 @@ class IcebergCalving:
             "volume": x_tot * thick,
             "bin":    np.digitize(x_tot, self.bins, right=True),
         }).query("area >= @self.area_min").reset_index(drop=True)
+
+    @staticmethod
+    def _n_bergs(a, xmin, xmax, area_tot):
+        """
+        Number of bergs to draw for a total area area_tot [km²]: area_tot
+        divided by the mean of the truncated power law, so that rescaling the
+        sample to the discharge changes the drawn areas by a factor ~1 and
+        the distribution is kept; at least one berg if there is discharge.
+
+        (Was area_tot / median.  The mean of a power law is much larger than
+        its median (a = 1.52 on 0.01-400 km²: median 0.04 km², mean 1.7 km²),
+        so ~45x too many bergs were drawn and the rescaling shrank every berg
+        by that factor: most fell below xmin and were dropped, and the size
+        distribution was not the intended one.)
+        """
+        if area_tot <= 0:
+            return 0
+        if abs(a - 2.0) < 1e-9:
+            mean = math.log(xmax / xmin) / (1.0 / xmin - 1.0 / xmax)
+        else:
+            mean = ((1.0 - a) / (2.0 - a)
+                    * (xmax ** (2.0 - a) - xmin ** (2.0 - a))
+                    / (xmax ** (1.0 - a) - xmin ** (1.0 - a)))
+        return max(1, int(round(area_tot / mean)))
+
+    @staticmethod
+    def _draw_areas(a, xmin, xmax, N):
+        """
+        N berg areas [km²] from a power law with exponent a on [xmin, xmax],
+        sampled exactly (inverse CDF of the truncated power law).
+
+        (Was powerlaw.Power_Law(...).generate_random, which ignores xmax: at
+        a = 1.52 most of a sample's sum came from values far above xmax, so
+        after rescaling to the discharge nearly all bergs fell below xmin and
+        were dropped -- for a small basin all of them, i.e. the discharge was
+        lost -- and bergs larger than ibareamax were seeded.)
+        """
+        u = np.random.random(N)
+        e = 1.0 - a
+        return (xmin ** e + u * (xmax ** e - xmin ** e)) ** (1.0 / e)
 
     def _scale_icebergs(self, df):
         """
