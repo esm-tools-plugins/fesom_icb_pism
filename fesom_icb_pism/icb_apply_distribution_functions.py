@@ -385,9 +385,12 @@ class IcebergCalving:
         df = self.df
         rows = []
         n_unknown = 0
+        # summed like feat/cavitiy (pandas groupby sum), so that with default
+        # settings the bergs are identical to that branch
+        sums = df.groupby(["basin", "ftype"])["disch"].sum()
         for (bid, ft), grp in df.groupby(["basin", "ftype"]):
             d = grp["disch"].abs().values
-            disch = float(grp["disch"].astype("float64").sum())
+            disch = float(sums.loc[(bid, ft)])
             if not self.size_from_ice:
                 amax = self._limit_by_discharge(self.area_max, disch,
                                                 self.thick_max)
