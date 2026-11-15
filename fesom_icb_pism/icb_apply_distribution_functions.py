@@ -811,7 +811,7 @@ class IcebergCalving:
 
     def _convert_fesom_to_m3_year(self):
         """fw [m/s] × node area [m²] × s/yr → m³/yr water per node."""
-        seconds_per_year = 365.25 * 86400
+        seconds_per_year = 365 * 86400   # 365-day model calendar
         self.data = self.fw_cavity * self.node_area_cavity * seconds_per_year
 
     def _get_fesom_coords(self):
