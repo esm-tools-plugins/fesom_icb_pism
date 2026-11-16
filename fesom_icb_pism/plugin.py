@@ -52,6 +52,22 @@ def _per_file(value, n, name):
     return value
 
 
+def _plain(value):
+    """
+    Strip esm_tools' provenance wrapper from None values (YAML null becomes a
+    NoneWithProvenance, for which ``is None`` is False), also inside lists.
+    """
+    if isinstance(value, type(None)):
+        return None
+    if isinstance(value, list):
+        return [_plain(v) for v in value]
+    return value
+
+
+def _fget(config, key, default=None):
+    return _plain(config["fesom"].get(key, default))
+
+
 def _seed(config):
     date = config["general"]["current_date"]
     return int(str(date.year) + str(date.month))
@@ -60,58 +76,58 @@ def _seed(config):
 def update_icebergs(config):
     if (
         config["general"].get("with_icb", False)
-        and config["fesom"].get("update_icebergs", False)
+        and _fget(config, "update_icebergs", False)
         and config["general"]["run_number"] > 1
     ):
         print(" * starting update icebergs")
 
-        engine = config["fesom"].get("icbgen_engine", "none")
+        engine = _fget(config, "icbgen_engine", "none")
         if engine not in (None, "none", "default"):
             raise ValueError(
                 f"fesom_icb_pism: icbgen_engine '{engine}' is no longer supported; "
                 "remove it from the runscript (only the default engine exists)"
             )
 
-        disch_file = config["fesom"].get("disch_file", "")
-        iceberg_dir = config["fesom"].get(
+        disch_file = _fget(config, "disch_file", "")
+        iceberg_dir = _fget(config, 
             "iceberg_dir", config["general"]["experiment_couple_dir"]
         )
         mesh_dir = config["fesom"][
             "mesh_dir"
         ]  # ["namelist_changes"]["namelist.config"]["paths"]["meshpath"]
-        basin_file = config["fesom"].get("basin_file", "")
+        basin_file = _fget(config, "basin_file", "")
         icb_restart_file = (
-            config["fesom"].get("restart_in_sources", {}).get("icb_restart_ISM") or ""
+            _fget(config, "restart_in_sources", {}).get("icb_restart_ISM") or ""
         )
-        scaling_factor = config["fesom"].get("scaling_factor", [1, 1, 1, 1, 1, 1])
+        scaling_factor = _fget(config, "scaling_factor", [1, 1, 1, 1, 1, 1])
         print(" * use scaling factors ", scaling_factor)
-        bcavities = config["fesom"].get("use_cav", False)
+        bcavities = _fget(config, "use_cav", False)
 
         # calving input: "pism" (PISM discharge, default) or "fesom" (FESOM
         # cavity freshwater flux); mesh_diag_file defaults to
         # <mesh_dir>/fesom.mesh.diag.nc (only used for "fesom")
-        input_type = config["fesom"].get("icb_input_type", "pism")
-        mesh_diag_file = config["fesom"].get("mesh_diag_file")
+        input_type = _fget(config, "icb_input_type", "pism")
+        mesh_diag_file = _fget(config, "mesh_diag_file")
         print(f" * icb_input_type = {input_type}")
 
         # berg thickness / size limit from the ice sheet geometry instead of
         # the prescribed 250 m / ibareamax (PISM input only). thk and topg are
         # read from icb_geometry_file (default: the discharge file).
         size_kw = dict(
-            size_from_ice=config["fesom"].get("icb_size_from_ice", False),
+            size_from_ice=_fget(config, "icb_size_from_ice", False),
             # optional size limit for grounded fronts (berg length <= ratio *
             # front thickness); default off: areas follow the observed power law
-            length_thickness_ratio=config["fesom"].get(
+            length_thickness_ratio=_fget(config, 
                 "icb_length_thickness_ratio"
             ),
             # "deep": seed in the nearest element deep enough for the draft,
             # "thin": make the berg thinner instead, "none": no check
-            draft=config["fesom"].get("icb_draft", "deep"),
-            deep_max_rings=config["fesom"].get("icb_deep_max_rings", 10),
+            draft=_fget(config, "icb_draft", "deep"),
+            deep_max_rings=_fget(config, "icb_deep_max_rings", 10),
             # carry the difference between seeded volume and discharge to the
             # next year (berg sizes then follow the power law); default: on
             # with icb_size_from_ice, off otherwise
-            carry_over=config["fesom"].get("icb_carry_over"),
+            carry_over=_fget(config, "icb_carry_over"),
             carry_file=os.path.join(
                 config["general"]["experiment_couple_dir"], "icb_carry_over.json"
             ),
@@ -121,11 +137,11 @@ def update_icebergs(config):
         # of disch_file (e.g. ibareamax: [10000, 400] for [sh, greenland]).
         # icb_max_berg_years: largest berg of a basin = at most this many years
         # of its discharge (use with a large ibareamax and carry-over).
-        geometry_file = config["fesom"].get("icb_geometry_file")
-        ibareamax = config["fesom"].get("ibareamax", 400)
-        max_berg_years = config["fesom"].get("icb_max_berg_years")
+        geometry_file = _fget(config, "icb_geometry_file")
+        ibareamax = _fget(config, "ibareamax", 400)
+        max_berg_years = _fget(config, "icb_max_berg_years")
 
-        if config["fesom"].get("rotate", False):
+        if _fget(config, "rotate", False):
             abg = [50, 15, -90]
         else:
             abg = [0, 0, 0]
@@ -141,7 +157,7 @@ def update_icebergs(config):
                     "fesom_icb_pism: disch_file and basin_file need to be of same length"
                 )
             n = len(disch_file)
-            domain = _per_file(config["fesom"].get("domain", "sh"), n, "domain")
+            domain = _per_file(_fget(config, "domain", "sh"), n, "domain")
             geometry_file = _per_file(geometry_file, n, "icb_geometry_file")
             ibareamax = _per_file(ibareamax, n, "ibareamax")
             max_berg_years = _per_file(max_berg_years, n, "icb_max_berg_years")
@@ -184,7 +200,7 @@ def update_icebergs(config):
                 max_berg_years=_per_file(
                     max_berg_years, 1, "icb_max_berg_years"
                 )[0],
-                domain=config["fesom"].get("domain", "sh"),
+                domain=_fget(config, "domain", "sh"),
                 bcavities=bcavities,
                 abg=abg,
                 input_type=input_type,

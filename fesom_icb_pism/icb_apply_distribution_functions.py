@@ -167,9 +167,9 @@ class IcebergCalving:
         carry_file=None,
         year=None,
     ):
-        if abg is None:
+        if isinstance(abg, type(None)):
             abg = [50, 15, -90]
-        if scaling_factor is None:
+        if isinstance(scaling_factor, type(None)):
             scaling_factor = [1, 1, 1, 1, 1, 1]
 
         np.random.seed(seed)
@@ -219,7 +219,7 @@ class IcebergCalving:
         self.size_from_ice = bool(size_from_ice)
         self.geometry_file = geometry_file or ifile
         self.length_thickness_ratio = (
-            None if length_thickness_ratio is None
+            None if isinstance(length_thickness_ratio, type(None))
             else float(length_thickness_ratio)
         )
         if draft not in ("deep", "thin", "none"):
@@ -231,17 +231,17 @@ class IcebergCalving:
         # carry-over between years (see module docstring); default: on with
         # size_from_ice, off for the prescribed distribution
         self.max_berg_years = (
-            None if max_berg_years is None else float(max_berg_years)
+            None if isinstance(max_berg_years, type(None)) else float(max_berg_years)
         )
         if self.max_berg_years is not None:
             print(f" * largest berg per basin: at most {self.max_berg_years:g} "
                   f"years of its discharge (ibareamax = {ibareamax} km2)")
         self.carry_over = (
-            self.size_from_ice if carry_over is None else bool(carry_over)
+            self.size_from_ice if isinstance(carry_over, type(None)) else bool(carry_over)
         )
         self.carry_file = carry_file or os.path.join(icb_path,
                                                      "icb_carry_over.json")
-        self.year = None if year is None else int(year)
+        self.year = None if isinstance(year, type(None)) else int(year)
         if self.carry_over and self.year is None:
             raise ValueError("carry_over=True needs the model year (year=...)")
         self._carry_prefix = (f"{domain}|{os.path.basename(str(basin_file))}"
