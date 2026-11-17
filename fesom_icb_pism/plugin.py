@@ -121,8 +121,9 @@ def update_icebergs(config):
                 "icb_length_thickness_ratio"
             ),
             # "deep": seed in the nearest element deep enough for the draft,
-            # "thin": make the berg thinner instead, "none": no check
-            draft=_fget(config, "icb_draft", "deep"),
+            # "thin": make the berg thinner instead, "none": no check;
+            # unset: "deep" with icb_size_from_ice, "none" otherwise
+            draft=_fget(config, "icb_draft"),
             deep_max_rings=_fget(config, "icb_deep_max_rings", 10),
             # carry the difference between seeded volume and discharge to the
             # next year (berg sizes then follow the power law); default: on

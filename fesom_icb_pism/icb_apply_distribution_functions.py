@@ -79,14 +79,17 @@ ice sheet sets the geometry:
   over in their first step.
 * Draft (water depth at the seeding element = shallowest of its three node
   depths, aux3d.out; draft = thickness * rho_ice / rho_sw):
-    draft="deep" (default): a berg whose draft exceeds the water depth of the
+    draft="deep" (default with size_from_ice): a berg whose draft exceeds the water depth of the
       calving elements is seeded in the nearest element that is deep enough
       (successive rings of neighbours, up to deep_max_rings; within a ring the
       usual fits / not-full tiers apply).  If there is none, it falls back to
       "thin" in the element chosen as usual.
     draft="thin": the berg stays at the calving elements and is made thinner
       (and wider at constant volume) to float there.
-    draft="none": no check; FESOM grounds bergs that are too deep.
+    draft="none" (default otherwise): no check; FESOM grounds bergs that are
+      too deep.
+  The draft check also works with the prescribed sizes (size_from_ice=False)
+  when icb_draft is set explicitly.
 
 The power-law exponent is unchanged.  thk and topg are read from geometry_file (default: the
 discharge file; must be on the same grid).
@@ -160,7 +163,7 @@ class IcebergCalving:
         size_from_ice=False,
         geometry_file=None,
         length_thickness_ratio=None,
-        draft="deep",
+        draft=None,
         deep_max_rings=10,
         carry_over=None,
         max_berg_years=None,
@@ -222,11 +225,15 @@ class IcebergCalving:
             None if isinstance(length_thickness_ratio, type(None))
             else float(length_thickness_ratio)
         )
+        # an explicit draft is always honoured; unset: "deep" with
+        # size_from_ice, "none" otherwise (same bergs as before by default)
+        if isinstance(draft, type(None)):
+            draft = "deep" if self.size_from_ice else "none"
         if draft not in ("deep", "thin", "none"):
             raise ValueError(
                 f"draft must be 'deep', 'thin' or 'none', not {draft!r}"
             )
-        self.draft = draft if self.size_from_ice else "none"
+        self.draft = draft
         self.deep_max_rings = int(deep_max_rings)
         # carry-over between years (see module docstring); default: on with
         # size_from_ice, off for the prescribed distribution
@@ -255,6 +262,9 @@ class IcebergCalving:
         self.rho_sw = 1027.0         # sea water, for the draft limit
         self.thk_min = 10.0          # m, cells thinner than this are ice free
         print(f" * size_from_ice = {self.size_from_ice}")
+        print(f" * draft = {self.draft}"
+              + (f" (up to {self.deep_max_rings} rings)"
+                 if self.draft == "deep" else ""))
         if self.size_from_ice:
             if self.input_type != "pism":
                 raise ValueError(
@@ -263,9 +273,6 @@ class IcebergCalving:
             print(f" * geometry file = {self.geometry_file}")
             print(f" * length/thickness ratio (grounded fronts) = "
                   f"{self.length_thickness_ratio or 'off'}")
-            print(f" * draft = {self.draft}"
-                  + (f" (up to {self.deep_max_rings} rings)"
-                     if self.draft == "deep" else ""))
 
         # ── read calving input ─────────────────────────────────────────
         if self.input_type == "pism":
