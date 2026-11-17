@@ -118,7 +118,9 @@ drawn bergs are rescaled to the discharge, which biases against the largest
 bergs, and a basin can never calve a berg bigger than one year of its
 discharge.  With carry-over, bergs are drawn one at a time until the target
 (this year's discharge + last year's carry) is reached; the berg that crosses
-the target is always kept and the difference is carried to the next year.
+the target is kept with probability (target left) / (its volume), and the
+difference (negative or positive, zero on average) is carried to the next
+year.
 Sizes then follow the power law, and mass is conserved over the years
 instead of every year (a basin may run ahead by a few years of discharge,
 like episodic calving of large tabular bergs).
@@ -296,8 +298,6 @@ class IcebergCalving:
         self._read_nod2d_file()    # rotated lon/lat from nod2d.out
         self._read_elem2d_file()
         self._build_rotation_matrix()   # g2r / r2g from abg Euler angles
-        if self.draft != "none":
-            self._build_elem_max_thickness()
 
         # ── node-level cavity depths ───────────────────────────────────
         self._cavity_node_depth = None
@@ -308,6 +308,8 @@ class IcebergCalving:
                 " * WARNING: bcavities=True but cavity_depth@node.out not found; "
                 "cavity filtering skipped"
             )
+        if self.draft != "none":
+            self._build_elem_max_thickness()
 
         # ── build valid-element set ────────────────────────────────────
         self._build_node_coord_arrays()   # rotated coords from nod2d.out
@@ -762,11 +764,19 @@ class IcebergCalving:
     def _build_elem_max_thickness(self):
         """
         Largest berg thickness [km] that floats in each element: the element
-        depth is the shallowest of its three node depths (mesh.topo from
-        aux3d.out), draft = thickness * rho_ice / rho_sw.
+        depth is the shallowest water column of its three nodes (mesh.topo
+        from aux3d.out, minus the ice shelf draft from cavity_depth@node.out
+        with cavities), draft = thickness * rho_ice / rho_sw.
         """
         depth = np.abs(np.asarray(self.mesh.topo, dtype=float))   # m, per node
         nodes = self.elem2d.values.astype(int) - 1
+        if self.bcavities and self._cavity_node_depth is not None:
+            # _cavity_node_depth is indexed by node id (1-based), <= 0 in m.
+            # Floor: the shallowest seafloor of the mesh (20 m for PI_ICEv2),
+            # as without cavities; some nodes have no water under the shelf
+            # (cavity depth = bottom depth), which would make the limit 0.
+            cav = np.abs(self._cavity_node_depth[1:depth.size + 1])
+            depth = np.maximum(depth - cav, depth.min())
         elem_depth = depth[nodes].min(axis=1)
         self._elem_max_thick = elem_depth * self.rho_sw / self.rho_ice / 1e3
 
@@ -1332,7 +1342,9 @@ class IcebergCalving:
         """
         Draw bergs one at a time until this year's target (discharge + carry
         from last year, km³) is reached.  The berg that crosses the target is
-        kept; the remainder (<= 0, i.e. taken from next year) is carried.
+        kept with probability (target left) / (its volume), so that the carry
+        is zero on average; the remainder (taken from or left for next year)
+        is carried.
         """
         k = self._carry_key(key)
         carry_in = float(self._carry_in.get(k, 0.0))
@@ -1343,8 +1355,11 @@ class IcebergCalving:
             cum = total + np.cumsum(x * thk(x))
             n = int(np.searchsorted(cum, target))   # first berg reaching target
             if n < x.size:
-                areas.append(x[: n + 1])
-                total = float(cum[n])
+                before = float(cum[n - 1]) if n > 0 else total
+                v = float(cum[n]) - before
+                keep = np.random.random() < (target - before) / v
+                areas.append(x[: n + 1] if keep else x[:n])
+                total = float(cum[n]) if keep else before
                 break
             areas.append(x)
             total = float(cum[-1])
