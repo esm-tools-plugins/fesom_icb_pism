@@ -1,0 +1,75 @@
+# Example: iceberg seeding with fesom_icb_pism in an AWI-ESM + PISM runscript
+# (Antarctica + Greenland). Only the iceberg-related entries are shown; merge
+# them into the general / fesom sections of your runscript.
+#
+# All paths are relative to esm-tools variables. Set icb_pool_dir to the
+# directory holding your iceberg input (basin masks, initial discharge files).
+#
+# Every new option can be left out: without them the plugin behaves exactly as
+# before (prescribed power law, berg thickness min(sqrt(area), 250 m), seeded
+# volume = discharge every year).
+
+general:
+    with_icb: True
+    icb_pool_dir: "path/to/iceberg/pool"     # e.g. a directory in your project space
+
+fesom:
+    # ----------------------------------------------------------------------
+    # Inputs: one entry per ice sheet, all lists in the same order
+    # ----------------------------------------------------------------------
+    disch_file:                               # yearly mean PISM discharge (written by the coupling)
+        - "${general.experiment_couple_dir}/pism_sh/latest_discharge.nc"
+        - "${general.experiment_couple_dir}/pism_nh/latest_discharge.nc"
+    basin_file:                               # basin mask on the PISM grid
+        - "${general.icb_pool_dir}/basins/antarctica.16km.nc"
+        - "${general.icb_pool_dir}/basins/greenland.nc"
+    domain:                                   # sets the power-law exponent: sh 1.52, greenland 2.02-2.38
+        - "sh"
+        - "greenland"
+    scaling_factor: [500, 200, 50, 1, 1]      # bergs per output object in the size bins
+                                              # 0.1, 1, 10, 100, 1000 km² (bigger bergs: 1)
+    rotate: False                             # True only for meshes stored in rotated coordinates
+    use_cav: True                             # do not seed into ice-shelf cavities
+
+    # ----------------------------------------------------------------------
+    # Berg sizes
+    # ----------------------------------------------------------------------
+    # Largest berg area [km²]: one value for all ice sheets or one per disch_file.
+    # The observed Antarctic power law (Tournadre et al. 2016,
+    # doi:10.1002/2015JC011178) holds up to ~10,000 km²; with 400 km² only ~49 %
+    # instead of ~89 % of the volume is in bergs > 100 km².
+    ibareamax: [10000, 400]
+
+    # Largest berg of a basin = at most K years of that basin's own discharge,
+    # area_max = min(ibareamax, K * discharge / thickness). Giant bergs then come
+    # only from basins with large discharge, and with carry-over no basin seeds
+    # more than K years ahead. One value or one per disch_file; null = no limit.
+    icb_max_berg_years: [10, null]
+
+    # Carry the difference between seeded volume and discharge to the next year
+    # (per basin, state in <couple dir>/icb_carry_over.json; delete it to reset).
+    # Bergs are drawn one at a time; sizes then follow the power law, mass is
+    # conserved over the years instead of every year.
+    # Default: on with icb_size_from_ice, off otherwise.
+    icb_carry_over: true
+
+    # ----------------------------------------------------------------------
+    # Berg geometry from the ice sheet (PISM input only)
+    # ----------------------------------------------------------------------
+    # Thickness = PISM front thickness (thk), front type grounded / floating
+    # (thk, topg), height limited by FESOM's roll-over criterion. Default: false.
+    icb_size_from_ice: true
+    icb_geometry_file:                        # PISM file with thk and topg on the discharge grid
+        - "${general.experiment_dir}/outdata/pism_sh/latest_ex_file_pism.nc"
+        - "${general.experiment_dir}/outdata/pism_nh/latest_ex_file_pism.nc"
+
+    # Bergs whose draft exceeds the water depth where they calve:
+    #   deep (default): seed in the nearest element that is deep enough
+    #   thin:           make them thinner (and wider, same volume)
+    #   none:           no check (FESOM grounds them)
+    icb_draft: deep
+    icb_deep_max_rings: 10                    # how far "deep" searches (rings of neighbour elements)
+
+    # Optional size limit for grounded (tidewater) fronts: berg length <= ratio *
+    # front thickness. Departs from the observed power law; default: off.
+    # icb_length_thickness_ratio: 4.0

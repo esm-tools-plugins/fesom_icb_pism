@@ -5,6 +5,7 @@ from .icb_apply_distribution_functions import IcebergCalving
 
 from esm_runscripts.namelists import Namelist
 
+
 def prep_icebergs(config):
     if "fesom" in config["general"]["valid_model_names"]:
         if config["general"].get("with_icb", False) and config["fesom"].get(
@@ -12,91 +13,181 @@ def prep_icebergs(config):
         ):
             # if not config["general"].get("iterative_coupling", False):
             config = update_icebergs(config)
-            if ((config["general"].get("run_number", 0) == 1) or (not os.path.exists(config["fesom"]["restart_in_sources"].get("icb_restart_ISM")))):
+            num_file = os.path.join(
+                config["general"]["experiment_couple_dir"], "num_non_melted_icb_file"
+            )
+            icb_restart = (
+                config["fesom"].get("restart_in_sources", {}).get("icb_restart_ISM")
+                or ""
+            )
+            if (config["general"].get("run_number", 0) == 1) or (
+                not os.path.exists(icb_restart)
+            ):
                 print("* either first year of simulation or icb_restart_ISM is missing")
-                if not os.path.isfile(
-                    config["general"]["experiment_couple_dir"]
-                    + "/num_non_melted_icb_file"
-                ):
-                    with open(
-                        config["general"]["experiment_couple_dir"]
-                        + "/num_non_melted_icb_file",
-                        "w",
-                    ) as f:
-                        f.write("0")
+                # always reset (was: only if the file did not exist). A stale
+                # count from an earlier run would make ib_num larger than the
+                # number of bergs FESOM can actually read.
+                num_lines = 0
             else:
-                num_lines = sum(
-                    1
-                    for line in open(
-                        os.path.join(
-                            config["fesom"]["restart_in_sources"]["icb_restart_ISM"]
-                        )
-                    )
-                )
-                with open(
-                    config["general"]["experiment_couple_dir"]
-                    + "/num_non_melted_icb_file",
-                    "w",
-                ) as f:
-                    f.write(str(num_lines))
+                with open(icb_restart) as f:
+                    num_lines = sum(1 for _ in f)
+            with open(num_file, "w") as f:
+                f.write(str(num_lines))
 
         return config
+
+
+def _per_file(value, n, name):
+    """
+    One value per disch_file: a single value is used for all files, a list
+    must be as long as disch_file (same order).
+    """
+    if not isinstance(value, list):
+        return [value] * n
+    if len(value) != n:
+        raise ValueError(
+            f"fesom_icb_pism: {name} must be a single value or a list as long "
+            f"as disch_file ({n})"
+        )
+    return value
+
+
+def _plain(value):
+    """
+    Strip esm_tools' provenance wrapper from None values (YAML null becomes a
+    NoneWithProvenance, for which ``is None`` is False), also inside lists.
+    """
+    if isinstance(value, type(None)):
+        return None
+    if isinstance(value, list):
+        return [_plain(v) for v in value]
+    return value
+
+
+def _fget(config, key, default=None):
+    return _plain(config["fesom"].get(key, default))
+
+
+def _seed(config):
+    date = config["general"]["current_date"]
+    return int(str(date.year) + str(date.month))
 
 
 def update_icebergs(config):
     if (
         config["general"].get("with_icb", False)
-        and config["fesom"].get("update_icebergs", False)
+        and _fget(config, "update_icebergs", False)
         and config["general"]["run_number"] > 1
     ):
         print(" * starting update icebergs")
-        
-        disch_file = config["fesom"].get("disch_file", "")
-        iceberg_dir = config["fesom"].get(
+
+        engine = _fget(config, "icbgen_engine", "none")
+        if engine not in (None, "none", "default"):
+            raise ValueError(
+                f"fesom_icb_pism: icbgen_engine '{engine}' is no longer supported; "
+                "remove it from the runscript (only the default engine exists)"
+            )
+
+        disch_file = _fget(config, "disch_file", "")
+        iceberg_dir = _fget(config, 
             "iceberg_dir", config["general"]["experiment_couple_dir"]
         )
         mesh_dir = config["fesom"][
             "mesh_dir"
         ]  # ["namelist_changes"]["namelist.config"]["paths"]["meshpath"]
-        basin_file = config["fesom"].get("basin_file", "")
-        icb_restart_file = config["fesom"]["restart_in_sources"].get("icb_restart_ISM", "")
-        scaling_factor = config["fesom"].get("scaling_factor", [1, 1, 1, 1, 1, 1])
+        basin_file = _fget(config, "basin_file", "")
+        icb_restart_file = (
+            _fget(config, "restart_in_sources", {}).get("icb_restart_ISM") or ""
+        )
+        scaling_factor = _fget(config, "scaling_factor", [1, 1, 1, 1, 1, 1])
         print(" * use scaling factors ", scaling_factor)
-        bcavities = config["fesom"].get("use_cav", False)
+        bcavities = _fget(config, "use_cav", False)
 
-        # New parameters for FESOM input type
-        # input_type: "pism" (default, original PISM discharge) or "fesom" (FESOM cavity freshwater flux)
-        input_type = config["fesom"].get("icb_input_type", "pism")
-        # mesh_diag_file: path to fesom.mesh.diag.nc (defaults to mesh_dir + 'fesom.mesh.diag.nc')
-        mesh_diag_file = config["fesom"].get("mesh_diag_file", mesh_dir)
+        # calving input: "pism" (PISM discharge, default) or "fesom" (FESOM
+        # cavity freshwater flux); mesh_diag_file defaults to
+        # <mesh_dir>/fesom.mesh.diag.nc (only used for "fesom")
+        input_type = _fget(config, "icb_input_type", "pism")
+        mesh_diag_file = _fget(config, "mesh_diag_file")
         print(f" * icb_input_type = {input_type}")
-        print(f" * mesh_diag_file = {mesh_diag_file}")
 
-        if isinstance(disch_file, list) and isinstance(basin_file, list):
-            if len(disch_file) == len(basin_file):
-                domain = config["fesom"].get("domain", "sh")
-                fmode = "w"
-                for dfile,bfile,dom in zip(disch_file, basin_file, domain):
-                    ib = IcebergCalving(
-                        dfile,
-                        mesh_dir,
-                        iceberg_dir,
-                        bfile,
-                        icb_restart_file,
-                        scaling_factor=scaling_factor,
-                        seed=int(str(config["general"]["current_date"].year) + str(config["general"]["current_date"].month)),
-                        ibareamax=config["fesom"].get("ibareamax", 400),
-                        domain=dom, #config["fesom"].get("domain", "sh"),
-                        bcavities=bcavities,
-                        input_type=input_type,
-                        mesh_diag_file=mesh_diag_file,
-                    )
-                    ib.create_dataframe()
-                    ib._icb_generator(fmode=fmode)
-                    fmode = "a"
-            else:
-                print(" * disch_file and basin_file need to be of same length! Exit")
-                return -1
+        # berg thickness / size limit from the ice sheet geometry instead of
+        # the prescribed 250 m / ibareamax (PISM input only). thk and topg are
+        # read from icb_geometry_file (default: the discharge file).
+        size_kw = dict(
+            size_from_ice=_fget(config, "icb_size_from_ice", False),
+            # optional size limit for grounded fronts (berg length <= ratio *
+            # front thickness); default off: areas follow the observed power law
+            length_thickness_ratio=_fget(config, 
+                "icb_length_thickness_ratio"
+            ),
+            # "deep": seed in the nearest element deep enough for the draft,
+            # "thin": make the berg thinner instead, "none": no check;
+            # unset: "deep" with icb_size_from_ice, "none" otherwise
+            draft=_fget(config, "icb_draft"),
+            deep_max_rings=_fget(config, "icb_deep_max_rings", 10),
+            # carry the difference between seeded volume and discharge to the
+            # next year (berg sizes then follow the power law); default: on
+            # with icb_size_from_ice, off otherwise
+            carry_over=_fget(config, "icb_carry_over"),
+            carry_file=os.path.join(
+                config["general"]["experiment_couple_dir"], "icb_carry_over.json"
+            ),
+            year=config["general"]["current_date"].year,
+        )
+        # per disch_file: a single value for all files, or a list in the order
+        # of disch_file (e.g. ibareamax: [10000, 400] for [sh, greenland]).
+        # icb_max_berg_years: largest berg of a basin = at most this many years
+        # of its discharge (use with a large ibareamax and carry-over).
+        geometry_file = _fget(config, "icb_geometry_file")
+        ibareamax = _fget(config, "ibareamax", 400)
+        max_berg_years = _fget(config, "icb_max_berg_years")
+
+        if _fget(config, "rotate", False):
+            abg = [50, 15, -90]
+        else:
+            abg = [0, 0, 0]
+
+        if isinstance(disch_file, list) or isinstance(basin_file, list):
+            if not (isinstance(disch_file, list) and isinstance(basin_file, list)):
+                raise ValueError(
+                    "fesom_icb_pism: disch_file and basin_file must both be lists "
+                    "or both be single paths"
+                )
+            if len(disch_file) != len(basin_file):
+                raise ValueError(
+                    "fesom_icb_pism: disch_file and basin_file need to be of same length"
+                )
+            n = len(disch_file)
+            domain = _per_file(_fget(config, "domain", "sh"), n, "domain")
+            geometry_file = _per_file(geometry_file, n, "icb_geometry_file")
+            ibareamax = _per_file(ibareamax, n, "ibareamax")
+            max_berg_years = _per_file(max_berg_years, n, "icb_max_berg_years")
+            fmode = "w"
+            for dfile, bfile, dom, gfile, amax, kyears in zip(
+                disch_file, basin_file, domain, geometry_file, ibareamax,
+                max_berg_years,
+            ):
+                ib = IcebergCalving(
+                    dfile,
+                    mesh_dir,
+                    iceberg_dir,
+                    bfile,
+                    icb_restart_file,
+                    scaling_factor=scaling_factor,
+                    seed=_seed(config),
+                    ibareamax=amax,
+                    max_berg_years=kyears,
+                    domain=dom,
+                    bcavities=bcavities,
+                    abg=abg,
+                    input_type=input_type,
+                    mesh_diag_file=mesh_diag_file,
+                    geometry_file=gfile,
+                    **size_kw,
+                )
+                ib.create_distribution()
+                ib.generate_icebergs(fmode=fmode)
+                fmode = "a"
         else:
             ib = IcebergCalving(
                 disch_file,
@@ -105,14 +196,21 @@ def update_icebergs(config):
                 basin_file,
                 icb_restart_file,
                 scaling_factor=scaling_factor,
-                seed=int(str(config["general"]["current_date"].year) + str(config["general"]["current_date"].month)), 
-                ibareamax=config["fesom"].get("ibareamax", 400),
+                seed=_seed(config),
+                ibareamax=_per_file(ibareamax, 1, "ibareamax")[0],
+                max_berg_years=_per_file(
+                    max_berg_years, 1, "icb_max_berg_years"
+                )[0],
+                domain=_fget(config, "domain", "sh"),
                 bcavities=bcavities,
+                abg=abg,
                 input_type=input_type,
                 mesh_diag_file=mesh_diag_file,
+                geometry_file=geometry_file,
+                **size_kw,
             )
-            ib.create_dataframe()
-            ib._icb_generator(fmode="w")
+            ib.create_distribution()
+            ib.generate_icebergs(fmode="w")
     return config
 
 
@@ -153,9 +251,8 @@ def apply_iceberg_calving_to_namelists(config):
                 ib_num_old = 0
 
             print(" * iceberg_dir = ", config["fesom"].get("iceberg_dir"))
-            ib_num_new = sum(
-                1 for line in open(config["fesom"]["input_sources"].get("length"))
-            )
+            with open(config["fesom"]["input_sources"].get("length")) as f:
+                ib_num_new = sum(1 for _ in f)
             icebergs["ib_num"] = ib_num_old + ib_num_new
             nml["icebergs"] = icebergs
 
